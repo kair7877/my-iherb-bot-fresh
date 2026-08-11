@@ -403,11 +403,24 @@ async def main():
     await start_dummy_server()
     logging.info("🔎 Автоматический запуск фонового мониторинга скидок...")
     asyncio.create_task(scheduler())
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        logging.warning(f"Сброс webhook: {e}")
-    await dp.start_polling(bot)
+    
+    # Бесконечный цикл с плавным перехватом конфликтов (для идеального Render Redeploy)
+    while True:
+        try:
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                logging.warning(f"Сброс webhook: {e}")
+            await dp.start_polling(bot, handle_signals=False)
+            break
+        except Exception as e:
+            err_msg = str(e)
+            if "Conflict" in err_msg or "terminated by other" in err_msg or "409" in err_msg:
+                logging.warning("⏳ Замечен старый процесс бота (Render Redeploy). Ожидание 6 секунд, пока Render отключит старый контейнер...")
+                await asyncio.sleep(6)
+            else:
+                logging.error(f"Ошибка polling: {e}. Перезапуск через 5 секунд...")
+                await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
