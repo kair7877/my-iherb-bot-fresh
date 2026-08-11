@@ -411,7 +411,7 @@ async def main():
                 await bot.delete_webhook(drop_pending_updates=True)
             except Exception as e:
                 logging.warning(f"Сброс webhook: {e}")
-            await dp.start_polling(bot, handle_signals=False)
+            await dp.start_polling(bot)
             break
         except Exception as e:
             err_msg = str(e)
