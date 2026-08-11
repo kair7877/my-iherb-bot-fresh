@@ -1,1 +1,5 @@
-
+aiogram
+httpx
+beautifulsoup4
+curl_cffi
+aiohttp
