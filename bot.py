@@ -20,7 +20,7 @@ except ImportError:
 # КОНФИГУРАЦИЯ БОТА И МОНИТОРИНГА IHERB
 # ==========================================
 BOT_TOKEN = "8910776648:AAGbhcQ7CBH46QVq3lT9x6GmU8kgkFSJhqY"
-CHAT_ID = "iHerb Discount Monitor 2026"
+CHAT_ID = "-1004290840012"
 CHECK_INTERVAL_SECONDS = 900  # Каждые 15 минут
 
 # Фильтры отслеживания
