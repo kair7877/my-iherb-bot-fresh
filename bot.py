@@ -71,17 +71,11 @@ async def start_handler(message):
     subscribers.add(chat_id)
     logging.info(f"Пользователь подключился: Chat ID = {chat_id}")
     await message.answer(
-        f"👋 <b>Привет! Ваш iHerb Бот Скидок активирован и работает!</b>
-
-"
-        f"🆔 Ваш Chat ID: <code>{chat_id}</code>
-"
-        f"🟢 Статус сервера: <b>LIVE (Онлайн)</b>
-"
-        f"🎯 Отслеживаемые бренды: {', '.join(TARGET_BRANDS) if TARGET_BRANDS else 'Все бренды'}
-
-"
-        f"👇 Нажмите кнопку <b>«🔥 Получить скидки»</b> или отправьте команда <b>/deals</b> или слово <b>скидки</b>!",
+        f"👋 <b>Привет! Ваш iHerb Бот Скидок активирован и работает!</b>\n\n"
+        f"🆔 Ваш Chat ID: <code>{chat_id}</code>\n"
+        f"🟢 Статус сервера: <b>LIVE (Онлайн)</b>\n"
+        f"🎯 Отслеживаемые бренды: {', '.join(TARGET_BRANDS) if TARGET_BRANDS else 'Все бренды'}\n\n"
+        f"👇 Нажмите кнопку <b>«🔥 Получить скидки»</b> или отправьте команду <b>/deals</b> или слово <b>скидки</b>!",
         reply_markup=main_keyboard,
         parse_mode=ParseMode.HTML
     )
@@ -104,22 +98,13 @@ async def status_handler(message):
     subscribers.add(chat_id)
     brands_str = ", ".join(TARGET_BRANDS) if TARGET_BRANDS else "Все бренды"
     await message.answer(
-        f"📊 <b>Статус Бота Мониторинга iHerb:</b>
-
-"
-        f"🟢 Сервер: <b>Работает (Render Cloud)</b>
-"
-        f"⚙️ Интервал проверки: каждые {CHECK_INTERVAL_SECONDS // 60} мин.
-"
-        f"🎯 Минимальная скидка: {MIN_DISCOUNT_PERCENT}%
-"
-        f"🏷️ Избранные бренды: {brands_str}
-"
-        f"💱 Курс KZT: 1 USD = {KZT_EXCHANGE_RATE} ₸
-"
-        f"📈 Наценка реселлера: +{MARGIN_MARKUP_PERCENT}%
-
-"
+        f"📊 <b>Статус Бота Мониторинга iHerb:</b>\n\n"
+        f"🟢 Сервер: <b>Работает (Render Cloud)</b>\n"
+        f"⚙️ Интервал проверки: каждые {CHECK_INTERVAL_SECONDS // 60} мин.\n"
+        f"🎯 Минимальная скидка: {MIN_DISCOUNT_PERCENT}%\n"
+        f"🏷️ Избранные бренды: {brands_str}\n"
+        f"💱 Курс KZT: 1 USD = {KZT_EXCHANGE_RATE} ₸\n"
+        f"📈 Наценка реселлера: +{MARGIN_MARKUP_PERCENT}%\n\n"
         f"Нажмите кнопку ниже, чтобы проверить скидки прямо сейчас 👇",
         reply_markup=main_keyboard,
         parse_mode=ParseMode.HTML
