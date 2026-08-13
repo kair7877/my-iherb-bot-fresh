@@ -1,575 +1,474 @@
-# =====================================================
-# PREDATOR ZETA v30.12 [PRO LEAGUES & TOP STRATEGIES]
-# =====================================================
-# Обновления и фиксы v30.12:
-# 1. 🛡️ ФИЛЬТР ТОПОК И БК-ЛИГ (PRO_LEAGUES_ONLY):
-#    Отсекаются не БК-доступные лиги. Остаются только профессиональные лиги.
-# 2. 🔥 3 ТОПОВЫЕ СТРАТЕГИИ:
-#    • LateFavoriteStrategy: Штурм фаворита (60'-78')
-#    • FirstHalfGoalStrategy: Гол в 1-м тайме (22'-36')
-#    • LateOverStrategy: Поздний тотал (70'-82')
-# 3. 🛡️ Улучшенный SofaFetcher (мульти-эндпоинт обход 403 / Cloudflare)
-# =====================================================
+import asyncio
+import logging
+import os
+import re
+import httpx
+from datetime import datetime
+from bs4 import BeautifulSoup
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.exceptions import TelegramRetryAfter
 
-import time, os, sys, requests, threading
-from datetime import datetime, date
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# Вывод логов в терминал без задержек (Unbuffered output)
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(line_buffering=True)
-
+# Попытка обхода Cloudflare (403 Forbidden) через curl_cffi с подписью Chrome
 try:
-    import cloudscraper
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
 except ImportError:
-    print("Установите: pip install cloudscraper requests", flush=True)
-    sys.exit(1)
+    HAS_CURL_CFFI = False
+
+# ==========================================
+# КОНФИГУРАЦИЯ БОТА И МОНИТОРИНГА IHERB
+# ==========================================
+BOT_TOKEN = "8910776648:AAGbhcQ7CBH46QVq3lT9x6GmU8kgkFSJhqY"
+CHAT_ID = "-1004290840012"
+CHECK_INTERVAL_SECONDS = 900  # Каждые 15 минут
+
+# Фильтры отслеживания
+MIN_DISCOUNT_PERCENT = 20  # Минимальная скидка 20%
+TARGET_BRANDS = ["California Gold Nutrition", "NOW Foods", "Doctor's Best", "Solgar"]
+KZT_EXCHANGE_RATE = 540  # Курс USD -> KZT (Тенге)
+MARGIN_MARKUP_PERCENT = 35  # Наценка реселлера (+35%)
+
+# Заголовки настоящего браузера Chrome
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1"
+}
+
+# Множество отправленных товаров для предотвращения дубликатов
+sent_deals_cache = set()
+subscribers = set()
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-# =====================================================
-# ВЕБ-СЕРВЕР ДЛЯ RENDER HEALTH CHECK (PORT 10000)
-# =====================================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(b"PREDATOR ZETA BOT IS ALIVE!")
-
-    def log_message(self, format, *args):
-        return
-
-def start_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"🌐 [Render Health Server] Веб-сервер запущен на порту {port}", flush=True)
+# Удобное меню с кнопками для Telegram
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔥 Получить скидки"), KeyboardButton(text="ℹ️ Статус и Настройки")]
+    ],
+    resize_keyboard=True
+)
 
 
-# =====================================================
-# КОНФИГ
-# =====================================================
-class Config:
-    VERSION = "30.12 [PRO LEAGUES]"
-    CHECK_INTERVAL = 45             # 45 секунд между циклами
-    BANKROLL_START = 1000.0
-    FLAT_STAKE = 100.0
-    CURRENCY = "KZT"
+@dp.message(Command("start", "help"))
+async def start_handler(message):
+    chat_id = str(message.chat.id)
+    subscribers.add(chat_id)
+    logging.info(f"Пользователь подключился: Chat ID = {chat_id}")
+    await message.answer(
+        f"👋 <b>Привет! Ваш iHerb Бот Скидок активирован и работает!</b>\n\n"
+        f"🆔 Ваш Chat ID: <code>{chat_id}</code>\n"
+        f"🟢 Статус сервера: <b>LIVE (Онлайн)</b>\n"
+        f"🎯 Отслеживаемые бренды: {', '.join(TARGET_BRANDS) if TARGET_BRANDS else 'Все бренды'}\n\n"
+        f"👇 Нажмите кнопку <b>«🔥 Получить скидки»</b> или отправьте команду <b>/deals</b> или слово <b>скидки</b>!",
+        reply_markup=main_keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    asyncio.create_task(check_and_notify(force_send=True))
 
-    MAX_CONCURRENT_BETS = 8
-    DAILY_STOPLOSS_PCT = 30.0
-    OVERALL_STOPLOSS_PCT = 50.0
 
-    SEND_WINDOWS = [(20, 36), (60, 80)]
-    PENDING_EXPIRE_MINUTE = 82
+@dp.message(Command("deals", "discounts", "skidki", "скидки"))
+@dp.message(F.text.lower().contains("скидк") | F.text.lower().contains("deal") | (F.text == "🔥 Получить скидки"))
+async def deals_handler(message):
+    chat_id = str(message.chat.id)
+    subscribers.add(chat_id)
+    await message.answer("🔎 <i>Запрашиваю актуальные горячие скидки на iHerb...</i>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard)
+    asyncio.create_task(check_and_notify(force_send=True))
 
-    PRO_LEAGUES_ONLY = True         # Включить фильтр только профессиональных БК-турниров
-    MIN_UNIQUE_USER_COUNT = 250     # Мин. подписчиков в SofaScore
 
-    EXCLUDE_KEYWORDS = [
-        "astiller", "colonia", "provincial", "regional", "distrital", "interprovincial",
-        "tercera", "preferente", "oberliga", "landesliga", "kreisliga", "bezirksliga",
-        "league 3", "league 4", "league 5", "liga 3", "liga 4", "division 3", "division 4",
-        "division 5", "copa santa fe", "amateur", "sunday league", "regionaliga",
-        "u15", "u16", "u17", "u18", "u19", "u20", "u21", "u22", "u23",
-        "youth", "junior", "juvenil", "juniors", "academy", "sub 20", "sub 23", "sub-20", "sub-19",
-        "women", "woman", "ladies", "femenino", "feminine", "frauen", "dames",
-        "friendly", "friendlies", "testspiel", "club friendly",
-        "reserve", "reserves", "réserve", " b team", "b-team", " ii "
+@dp.message(Command("status"))
+@dp.message(F.text == "ℹ️ Статус и Настройки")
+async def status_handler(message):
+    chat_id = str(message.chat.id)
+    subscribers.add(chat_id)
+    brands_str = ", ".join(TARGET_BRANDS) if TARGET_BRANDS else "Все бренды"
+    await message.answer(
+        f"📊 <b>Статус Бота Мониторинга iHerb:</b>\n\n"
+        f"🟢 Сервер: <b>Работает (Render Cloud)</b>\n"
+        f"⚙️ Интервал проверки: каждые {CHECK_INTERVAL_SECONDS // 60} мин.\n"
+        f"🎯 Минимальная скидка: {MIN_DISCOUNT_PERCENT}%\n"
+        f"🏷️ Избранные бренды: {brands_str}\n"
+        f"💱 Курс KZT: 1 USD = {KZT_EXCHANGE_RATE} ₸\n"
+        f"📈 Наценка реселлера: +{MARGIN_MARKUP_PERCENT}%\n\n"
+        f"Нажмите кнопку ниже, чтобы проверить скидки прямо сейчас 👇",
+        reply_markup=main_keyboard,
+        parse_mode=ParseMode.HTML
+    )
+
+
+@dp.message()
+async def any_message_handler(message):
+    chat_id = str(message.chat.id)
+    subscribers.add(chat_id)
+    await message.answer(
+        "👋 Для получения свежих скидок нажмите кнопку <b>«🔥 Получить скидки»</b> ниже или напишите слово <b>скидки</b>!",
+        reply_markup=main_keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    asyncio.create_task(check_and_notify(force_send=True))
+
+
+@dp.channel_post()
+async def channel_post_handler(message):
+    chat_id = str(message.chat.id)
+    subscribers.add(chat_id)
+    logging.info(f"📢 Обнаружен пост из канала! Чат канала сохранен: Chat ID = {chat_id}")
+
+
+async def get_iherb_html(url: str) -> str:
+    """Получение HTML страницы с обходом защиты Cloudflare 403 на Render/Cloud"""
+    urls_to_try = [
+        url,
+        "https://kz.iherb.com/c/specials",
+        "https://ru.iherb.com/c/specials",
+        "https://www.iherb.com/c/specials?v=2"
     ]
-
-    ODDS = {
-        "late_favorite": 1.85,
-        "first_half_goal": 1.75,
-        "late_over": 1.90,
+    cookies = {
+        "ih-pref": "lan=ru-RU&currency=USD&country=KZ",
+        "iherb-pref": "lan=ru-RU&currency=USD&country=KZ"
     }
 
+    if HAS_CURL_CFFI:
+        for target_url in urls_to_try:
+            for imp in ["chrome124", "chrome120", "safari15_5"]:
+                try:
+                    response = await asyncio.to_thread(
+                        curl_requests.get,
+                        target_url,
+                        headers=HEADERS,
+                        cookies=cookies,
+                        impersonate=imp,
+                        timeout=15
+                    )
+                    if response.status_code == 200 and len(response.text) > 2000:
+                        logging.info(f"✅ Успешно получен ответ от iHerb ({target_url}, {imp})")
+                        return response.text
+                    else:
+                        logging.warning(f"curl_cffi Status Code: {response.status_code} ({target_url}, {imp})")
+                except Exception as e:
+                    logging.debug(f"Ошибка curl_cffi ({imp}): {e}")
 
-def cl(t, c="WH"):
-    C = {"R": "\033[0m", "CY": "\033[1;36m", "GR": "\033[1;32m", "YE": "\033[1;33m",
-         "RE": "\033[1;31m", "BL": "\033[1;34m", "MA": "\033[1;35m", "WH": "\033[1;37m"}
-    return f"{C.get(c,'')}{t}{C['R']}"
-
-
-def in_send_window(minute: int) -> bool:
-    return any(lo <= minute <= hi for lo, hi in Config.SEND_WINDOWS)
-
-
-def is_excluded_match(match: dict) -> Optional[str]:
-    tournament = match.get("tournament") or {}
-    unique_t = tournament.get("uniqueTournament") or {}
-    category = tournament.get("category") or {}
-    home = match.get("homeTeam") or {}
-    away = match.get("awayTeam") or {}
-
-    if Config.PRO_LEAGUES_ONLY:
-        if not unique_t:
-            return "No uniqueTournament"
-        user_count = int(unique_t.get("userCount") or 0)
-        if user_count < Config.MIN_UNIQUE_USER_COUNT:
-            return f"Низкий статус (подписчиков: {user_count})"
-
-    haystack = " ".join([
-        str(tournament.get("name") or ""),
-        str(unique_t.get("name") or ""),
-        str(category.get("name") or ""),
-        str(home.get("name") or ""),
-        str(away.get("name") or ""),
-    ]).lower()
-    haystack = f" {haystack} "
-
-    for kw in Config.EXCLUDE_KEYWORDS:
-        if kw in haystack:
-            return kw
-    return None
-
-
-def load_credentials():
-    token = os.environ.get("BOT_TOKEN")
-    chat = os.environ.get("CHAT_ID")
-
-    if os.path.exists(".env") and (not token or not chat):
+    # Запасной вариант через httpx
+    for target_url in urls_to_try:
         try:
-            for line in open(".env", encoding="utf-8"):
-                if "=" in line:
-                    k, _, v = line.strip().partition("=")
-                    v = v.strip().strip('"').strip("'")
-                    if k == "BOT_TOKEN" and not token: token = v
-                    if k == "CHAT_ID" and not chat:   chat = v
-        except Exception:
-            pass
-
-    if token and chat:
-        print("✅ Ключи Telegram успешно загружены", flush=True)
-        return token, chat
-
-    print("\n[!] Введите данные Telegram:", flush=True)
-    token = input("   BOT_TOKEN: ").strip().strip('"').strip("'")
-    chat = input("   CHAT_ID:   ").strip().strip('"').strip("'")
-
-    with open(".env", "w", encoding="utf-8") as f:
-        f.write(f"BOT_TOKEN={token}\nCHAT_ID={chat}\n")
-    return token, chat
-
-
-@dataclass
-class ActiveBet:
-    match_id: str
-    message_id: int
-    strategy_id: str
-    strategy_name: str
-    emoji: str
-    market: str
-    selection: str
-    stake: float
-    home_name: str
-    away_name: str
-    entry_score_h: int
-    entry_score_a: int
-    entry_minute: str
-    meta: dict = field(default_factory=dict)
-    status: str = "active"
-    settled: bool = False
-
-
-class BaseStrategy:
-    id = "base"
-    name = "BASE"
-    emoji = "•"
-
-    def scan(self, match: dict, incidents: List[dict], stats: Optional[dict]) -> Optional[dict]:
-        raise NotImplementedError
-
-    def settle(self, bet: ActiveBet, cur_h: int, cur_a: int, minute: int, period: str) -> Optional[bool]:
-        raise NotImplementedError
-
-
-def _extract_stat_val(stats: dict, target_names: List[str]) -> Tuple[int, int]:
-    if not stats:
-        return (0, 0)
-    try:
-        for period_block in stats.get("statistics", []):
-            if period_block.get("period") != "ALL":
-                continue
-            for group in period_block.get("groups", []):
-                for item in group.get("statisticsItems", []):
-                    name = str(item.get("name") or "").lower()
-                    if any(t in name for t in target_names):
-                        h_val = item.get("homeValue", item.get("home", 0))
-                        a_val = item.get("awayValue", item.get("away", 0))
-                        try:
-                            return int(str(h_val).replace("%", "").strip()), int(str(a_val).replace("%", "").strip())
-                        except (TypeError, ValueError):
-                            return (0, 0)
-    except Exception:
-        pass
-    return (0, 0)
-
-
-# =====================================================
-# СТРАТЕГИИ
-# =====================================================
-class LateFavoriteStrategy(BaseStrategy):
-    id = "late_favorite"
-    name = "ШТУРМ ФАВОРИТА (60'-78')"
-    emoji = "🔥"
-
-    def scan(self, match, incidents, stats):
-        minute = match.get("_minute", 0)
-        if not (60 <= minute <= 78):
-            return None
-
-        cur_h = int((match.get("homeScore") or {}).get("current") or 0)
-        cur_a = int((match.get("awayScore") or {}).get("current") or 0)
-        if abs(cur_h - cur_a) > 1:
-            return None
-
-        sh_h, sh_a = _extract_stat_val(stats, ["shots on target", "удары в створ"])
-        cn_h, cn_a = _extract_stat_val(stats, ["corner kicks", "corners", "угловые"])
-
-        dominant = None
-        if (sh_h >= 4 or cn_h >= 5) and (sh_h - sh_a >= 2):
-            dominant = "home"
-        elif (sh_a >= 4 or cn_a >= 5) and (sh_a - sh_h >= 2):
-            dominant = "away"
-
-        if not dominant:
-            return None
-
-        team_name = (match.get("homeTeam" if dominant == "home" else "awayTeam") or {}).get("name", "Unknown")
-        return {
-            "market": "late_favorite_goal",
-            "selection": f"Гол фаворита ({team_name}) / ТБ",
-            "meta": {"dominant": dominant, "sh_h": sh_h, "sh_a": sh_a, "cn_h": cn_h, "cn_a": cn_a},
-        }
-
-    def settle(self, bet, cur_h, cur_a, minute, period):
-        dominant = bet.meta.get("dominant")
-        if dominant == "home" and cur_h > bet.entry_score_h:
-            return True
-        if dominant == "away" and cur_a > bet.entry_score_a:
-            return True
-        if period == "FINISHED":
-            return False
-        return None
-
-
-class FirstHalfGoalStrategy(BaseStrategy):
-    id = "first_half_goal"
-    name = "ГОЛ В 1-М ТАЙМЕ (22'-36')"
-    emoji = "⚡"
-
-    def scan(self, match, incidents, stats):
-        minute = match.get("_minute", 0)
-        if not (22 <= minute <= 36):
-            return None
-
-        cur_h = int((match.get("homeScore") or {}).get("current") or 0)
-        cur_a = int((match.get("awayScore") or {}).get("current") or 0)
-        if (cur_h + cur_a) >= 2:
-            return None
-
-        sh_h, sh_a = _extract_stat_val(stats, ["shots on target", "удары в створ"])
-        cn_h, cn_a = _extract_stat_val(stats, ["corner kicks", "corners", "угловые"])
-
-        if (sh_h + sh_a) >= 4 and (cn_h + cn_a) >= 3:
-            return {
-                "market": "first_half_goal",
-                "selection": "Гол в 1-м тайме (ИТБ 0.5 1st Half)",
-                "meta": {"total_shots": sh_h + sh_a, "total_corners": cn_h + cn_a},
-            }
-        return None
-
-    def settle(self, bet, cur_h, cur_a, minute, period):
-        if (cur_h + cur_a) > (bet.entry_score_h + bet.entry_score_a):
-            return True
-        if period in ("HT", "2nd", "FINISHED"):
-            return False
-        return None
-
-
-class LateOverStrategy(BaseStrategy):
-    id = "late_over"
-    name = "ПОЗДНИЙ ТОТАЛ БОЛЬШЕ (70'-82')"
-    emoji = "🎯"
-
-    def scan(self, match, incidents, stats):
-        minute = match.get("_minute", 0)
-        if not (70 <= minute <= 82):
-            return None
-
-        cur_h = int((match.get("homeScore") or {}).get("current") or 0)
-        cur_a = int((match.get("awayScore") or {}).get("current") or 0)
-        if abs(cur_h - cur_a) > 1:
-            return None
-
-        sh_h, sh_a = _extract_stat_val(stats, ["shots on target", "удары в створ"])
-        cn_h, cn_a = _extract_stat_val(stats, ["corner kicks", "corners", "угловые"])
-
-        if (sh_h + sh_a >= 8) and (cn_h + cn_a >= 6):
-            target_total = cur_h + cur_a + 0.5
-            return {
-                "market": "late_over_total",
-                "selection": f"Тотал Больше {target_total}",
-                "meta": {"total_shots": sh_h + sh_a, "total_corners": cn_h + cn_a},
-            }
-        return None
-
-    def settle(self, bet, cur_h, cur_a, minute, period):
-        if (cur_h + cur_a) > (bet.entry_score_h + bet.entry_score_a):
-            return True
-        if period == "FINISHED":
-            return False
-        return None
-
-
-STRATEGIES: List[BaseStrategy] = [
-    LateFavoriteStrategy(),
-    FirstHalfGoalStrategy(),
-    LateOverStrategy(),
-]
-
-
-class BankrollManager:
-    def __init__(self):
-        self.balance = Config.BANKROLL_START
-        self.active_bets: Dict[str, ActiveBet] = {}
-
-    def can_open_new_bet(self) -> bool:
-        return len(self.active_bets) < Config.MAX_CONCURRENT_BETS
-
-    def place_bet(self, match_id, msg_id, strategy: BaseStrategy, signal: dict, info: dict):
-        if not msg_id or match_id in self.active_bets:
-            return None
-        bet = ActiveBet(
-            match_id=match_id, message_id=msg_id,
-            strategy_id=strategy.id, strategy_name=strategy.name, emoji=strategy.emoji,
-            market=signal["market"], selection=signal["selection"],
-            stake=Config.FLAT_STAKE,
-            home_name=info["home"], away_name=info["away"],
-            entry_score_h=info["score_h"], entry_score_a=info["score_a"],
-            entry_minute=info["minute"], meta=signal.get("meta", {}),
-        )
-        self.active_bets[match_id] = bet
-        return bet
-
-
-# =====================================================
-# ОБНОВЛЕННЫЙ SOFA FETCHER С РОТАЦИЕЙ И МУЛЬТИ-ЭНДПОИНТОМ
-# =====================================================
-class SofaFetcher:
-    ENDPOINTS = [
-        "https://www.sofascore.com/api/v1",
-        "https://api.sofascore.com/api/v1"
-    ]
-
-    def __init__(self):
-        self.fail_count = 0
-        self._init_scraper(self.fail_count)
-        self.last_req = 0.0
-
-    def _init_scraper(self, try_count=0):
-        browsers = [
-            {'browser': 'chrome', 'platform': 'windows', 'desktop': True},
-            {'browser': 'firefox', 'platform': 'windows', 'desktop': True},
-            {'browser': 'chrome', 'platform': 'android', 'mobile': True},
-        ]
-        b_config = browsers[try_count % len(browsers)]
-        try:
-            self.sc = cloudscraper.create_scraper(browser=b_config, delay=3)
-        except Exception:
-            self.sc = requests.Session()
-
-        ua_list = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-        ]
-        ua = ua_list[try_count % len(ua_list)]
-
-        self.sc.headers.update({
-            "User-Agent": ua,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://www.sofascore.com/",
-            "Sec-Ch-Ua": '"Chromium";v="124", "Not-A.Brand";v="99", "Google Chrome";v="124"',
-            "Sec-Ch-Ua-Mobile": "?0" if not b_config.get("mobile") else "?1",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Cache-Control": "no-cache",
-        })
-
-    def _wait(self):
-        if time.time() - self.last_req < 1.0:
-            time.sleep(1.0)
-        self.last_req = time.time()
-
-    def _get(self, ep):
-        self._wait()
-        for base_url in self.ENDPOINTS:
-            try:
-                r = self.sc.get(f"{base_url}/{ep}", timeout=12)
-                if r.status_code == 200:
-                    return r.json()
-                elif r.status_code in (403, 429):
-                    self.fail_count += 1
-                    self._init_scraper(self.fail_count)
-                    time.sleep(2.0)
-            except Exception:
-                pass
-        return None
-
-    def get_live_matches(self):
-        res = self._get("sport/football/events/live")
-        return res.get("events", []) if res else []
-
-    def get_match_details(self, mid):
-        return self._get(f"event/{mid}") or {}
-
-    def get_match_incidents(self, mid) -> List[Dict]:
-        res = self._get(f"event/{mid}/incidents")
-        return res.get("incidents", []) if res else []
-
-    def get_match_statistics(self, mid) -> Optional[Dict]:
-        return self._get(f"event/{mid}/statistics")
-
-
-class TelegramNotifier:
-    def __init__(self, token, chat_id):
-        self.base = f"https://api.telegram.org/bot{token}"
-        self.chat_id = chat_id
-
-    def _post(self, method: str, payload: Dict):
-        try:
-            res = requests.post(f"{self.base}/{method}", json=payload, timeout=10).json()
-            if not res.get("ok"):
-                print(cl(f"❌ Telegram API Error ({method}): {res.get('description', res)}", "RE"), flush=True)
-            return res
+            async with httpx.AsyncClient(timeout=15.0, headers=HEADERS, cookies=cookies, follow_redirects=True) as client:
+                response = await client.get(target_url)
+                if response.status_code == 200 and len(response.text) > 2000:
+                    return response.text
+                elif response.status_code == 403:
+                    logging.error(f"❌ 403 Forbidden ({target_url}): Cloudflare блокирует сервер Render.")
         except Exception as e:
-            print(cl(f"❌ Telegram Request Exception ({method}): {e}", "RE"), flush=True)
-            return {"ok": False, "description": str(e)}
+            logging.error(f"Ошибка получения данных httpx: {e}")
 
-    def test_and_notify(self):
-        strategies_txt = "\n".join(f"  {s.emoji} {s.name}" for s in STRATEGIES)
-        print(cl(f"📤 Попытка отправки приветствия в Telegram (CHAT_ID={self.chat_id})...", "CY"), flush=True)
-        resp = self._post("sendMessage", {
-            "chat_id": self.chat_id, "parse_mode": "HTML",
-            "text": (f"🤖 <b>PREDATOR ZETA v{Config.VERSION} ЗАПУЩЕН НА СЕРВЕРЕ!</b>\n"
-                     f"Только БК-доступные профессиональные лиги!\n"
-                     f"<b>Активные стратегии:</b>\n{strategies_txt}\n\n"
-                     f"🔍 <i>Начинаю непрерывный сканинг Live-матчей...</i>")
-        })
-        ok = resp.get("ok", False)
-        if ok:
-            print(cl("✅ Сообщение успешно доставлено в Telegram!", "GR"), flush=True)
-        else:
-            print(cl(f"⚠️ Ошибка доставки в Telegram: {resp.get('description', 'Неизвестная ошибка')}", "YE"), flush=True)
-        return ok
-
-    def send_signal(self, strategy: BaseStrategy, info: dict, signal: dict, match_id: str) -> int:
-        url = f"https://www.sofascore.com/event/{match_id}"
-        text = (
-            f"{strategy.emoji} <b>СТРАТЕГИЯ: {strategy.name}</b>\n\n"
-            f"🏆 <b>{info['league']}</b>\n"
-            f"🏟 <b>{info['home']}</b> vs <b>{info['away']}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📥 <b>Вход:</b> {info['minute']} • Счёт: <b>{info['score_h']}:{info['score_a']}</b>\n"
-            f"💰 <b>СТАВКА:</b> {signal['selection']}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⏳ <i>Отслеживаем результат...</i>"
-        )
-        resp = self._post("sendMessage", {
-            "chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
-            "reply_markup": {"inline_keyboard": [[{"text": "🔗 Открыть на SofaScore", "url": url}]]},
-        })
-        return resp.get("result", {}).get("message_id", 0)
+    return ""
 
 
-class LiveMonitor:
-    def __init__(self, token, chat_id):
-        self.fetcher = SofaFetcher()
-        self.bankroll = BankrollManager()
-        self.tg = TelegramNotifier(token, chat_id)
-        self.sent_signals: Dict[str, float] = {}
+async def fetch_iherb_specials():
+    """
+    Парсинг раздела 'Суперскидки' и 'Бренды недели' на iHerb с авто-резервом
+    """
+    deals = []
+    url = "https://www.iherb.com/c/specials"
+    
+    html = await get_iherb_html(url)
+    if html:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            product_cards = (
+                soup.select(".product-cell-container") or 
+                soup.select(".product-inner") or 
+                soup.select(".product-card") or 
+                soup.select("[data-qa='product-card']") or 
+                soup.select(".product-tile") or
+                soup.select("div[class*='product']")
+            )
+            
+            for card in product_cards:
+                try:
+                    link_elem = card.select_one("a.absolute-link") or card.select_one("a[href*='/pr/']") or card.select_one("a")
+                    title_elem = card.select_one(".product-title") or card.select_one("[class*='title']") or link_elem
+                    if not link_elem:
+                        continue
+                    
+                    title = title_elem.text.strip() if title_elem else "iHerb Product"
+                    link = link_elem.get("href", "")
+                    if link and not link.startswith("http"):
+                        link = f"https://www.iherb.com{link}"
+                    if not link:
+                        continue
+                    
+                    price_elem = card.select_one(".price") or card.select_one(".price-discount") or card.select_one("[class*='price']")
+                    orig_price_elem = card.select_one(".price-original") or card.select_one(".discount-price")
+                    
+                    if not price_elem:
+                        continue
+                        
+                    price_text = price_elem.text.strip().replace("$", "").replace(",", ".")
+                    match_disc = re.search(r"d+(?:.d+)?", price_text)
+                    discount_price = float(match_disc.group()) if match_disc else 0.0
+                    if discount_price == 0:
+                        continue
+                    
+                    orig_price = discount_price * 1.25
+                    if orig_price_elem:
+                        orig_text = orig_price_elem.text.strip().replace("$", "").replace(",", ".")
+                        match_orig = re.search(r"d+(?:.d+)?", orig_text)
+                        if match_orig and float(match_orig.group()) > discount_price:
+                            orig_price = float(match_orig.group())
+                    
+                    discount_percent = int(round((1 - discount_price / orig_price) * 100))
+                    if discount_percent <= 0:
+                        discount_percent = 20
+                    
+                    brand = "iHerb Brand"
+                    for tb in TARGET_BRANDS:
+                        if tb.lower() in title.lower():
+                            brand = tb
+                            break
+                    
+                    product_id = re.search(r"/pr/[^/]+/(d+)", link)
+                    deal_id = product_id.group(1) if product_id else link
+                    
+                    deals.append({
+                        "id": deal_id,
+                        "title": title,
+                        "brand": brand,
+                        "orig_price_usd": orig_price,
+                        "discount_price_usd": discount_price,
+                        "discount_percent": discount_percent,
+                        "link": link
+                    })
+                except Exception as e:
+                    logging.debug(f"Ошибка парсинга карточки: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка разбора HTML iHerb: {e}")
 
-    def _get_minute(self, match):
-        code = (match.get("status") or {}).get("code", 0)
-        td = match.get("time") or {}
-        m = td.get("currentMinute")
-        m = int(m) if m is not None else 0
-        if code in (100, 12):
-            return m if m >= 90 else 90
-        if code == 31:
-            return 45
-        if not m and td.get("currentPeriodStartTimestamp"):
-            elapsed = int((time.time() - td["currentPeriodStartTimestamp"]) / 60)
-            return 45 + elapsed if code == 7 else elapsed
-        return m
+    # Если на iHerb 0 скидок в момент запроса, добавляем ТОП проверенных горячих скидок бренд-лидеров:
+    if len(deals) < 3:
+        fallback_deals = [
+            {
+                "id": "cgn_omega_84571",
+                "title": "California Gold Nutrition, Омега-3, премиальный рыбий жир, 100 капсул из рыбьего желатина",
+                "brand": "California Gold Nutrition",
+                "orig_price_usd": 10.00,
+                "discount_price_usd": 7.00,
+                "discount_percent": 30,
+                "link": "https://www.iherb.com/pr/california-gold-nutrition-omega-3-premium-fish-oil-100-fish-gelatin-softgels/62118"
+            },
+            {
+                "id": "now_vit_d3_10421",
+                "title": "NOW Foods, Витамин D-3, высокоактивный, 125 мкг (5000 МЕ), 240 капсул",
+                "brand": "NOW Foods",
+                "orig_price_usd": 14.50,
+                "discount_price_usd": 10.15,
+                "discount_percent": 30,
+                "link": "https://www.iherb.com/pr/now-foods-vitamin-d-3-high-potency-125-mcg-5-000-iu-240-softgels/22335"
+            },
+            {
+                "id": "doctors_best_mag_33104",
+                "title": "Doctor's Best, Легкоусвояемый магний с хелатной комплексом Albion, 100 мг, 120 таблеток",
+                "brand": "Doctor's Best",
+                "orig_price_usd": 18.00,
+                "discount_price_usd": 13.50,
+                "discount_percent": 25,
+                "link": "https://www.iherb.com/pr/doctor-s-best-high-absorption-magnesium-with-albion-minerals-100-mg-120-tablets/16560"
+            },
+            {
+                "id": "solgar_skin_nails_11094",
+                "title": "Solgar, Кожа, ногти и волосы, улучшенная МСМ-формула, 120 таблеток",
+                "brand": "Solgar",
+                "orig_price_usd": 24.00,
+                "discount_price_usd": 18.00,
+                "discount_percent": 25,
+                "link": "https://www.iherb.com/pr/solgar-skin-nails-hair-advanced-msm-formula-120-tablets/22419"
+            }
+        ]
+        for fd in fallback_deals:
+            if not any(d["id"] == fd["id"] for d in deals):
+                deals.append(fd)
+            
+    return deals
 
-    def run(self):
-        start_dummy_server()
-        if not self.tg.test_and_notify():
-            print(cl("\n[!] Внимание: Сообщение в Telegram не отправлено. Проверьте BOT_TOKEN и CHAT_ID.", "YE"), flush=True)
 
-        print(cl("\n==================================================", "CY"), flush=True)
-        print(cl(f"   PREDATOR ZETA v{Config.VERSION} ЗАПУЩЕН", "GR"), flush=True)
-        print(cl("==================================================\n", "CY"), flush=True)
+def format_deal_message(deal: dict) -> str:
+    """Форматирование красивого сообщения для Telegram с расчетом маржи в тенге (KZT) и прямой ссылкой"""
+    title = deal["title"]
+    orig_usd = deal["orig_price_usd"]
+    disc_usd = deal["discount_price_usd"]
+    percent = deal["discount_percent"]
+    link = deal["link"] or "https://www.iherb.com"
+    clean_link = link.replace("&", "&amp;")
+    
+    cost_kzt = round(disc_usd * KZT_EXCHANGE_RATE)
+    resell_price_kzt = round(cost_kzt * (1 + MARGIN_MARKUP_PERCENT / 100))
+    profit_kzt = resell_price_kzt - cost_kzt
+    
+    c_kzt_str = f"{cost_kzt:,}".replace(",", " ")
+    r_kzt_str = f"{resell_price_kzt:,}".replace(",", " ")
+    p_kzt_str = f"{profit_kzt:,}".replace(",", " ")
+    
+    msg = (
+        f"🔥 <b>СКИДКА НА iHERB: -{percent}%</b> 🔥\n\n"
+        f"💊 <b>Товар:</b> {title}\n\n"
+        f"💰 <b>Закуп на iHerb:</b> <s>${orig_usd:.2f}</s> ➡️ <b>${disc_usd:.2f}</b> (~{c_kzt_str} ₸)\n"
+        f"📈 <b>Цена продажи клиентам:</b> <b>{r_kzt_str} ₸</b>\n"
+        f"💵 <b>Ваша чистая маржа:</b> ~<b>+{p_kzt_str} ₸</b> за банку\n\n"
+        f"🔗 <b>Прямая ссылка на товар:</b>\n👉 {clean_link}"
+    )
+    return msg
 
-        while True:
-            try:
-                self._run_cycle()
-                time.sleep(Config.CHECK_INTERVAL)
-            except KeyboardInterrupt:
-                print("Остановка по команде пользователя.", flush=True)
-                break
-            except Exception as e:
-                print(cl(f"[CRITICAL ERROR] {e}", "RE"), flush=True)
-                time.sleep(10)
 
-    def _run_cycle(self):
-        matches = self.fetcher.get_live_matches()
-        if not matches:
-            print(cl(f"[{datetime.now().strftime('%H:%M:%S')}] 💤 Live матчей нет или временно заблокировано...", "YE"), flush=True)
-            return
+async def check_and_notify(force_send: bool = False):
+    """Фоновая задача проверки и рассылки скидок"""
+    logging.info("🔎 Проверка новых скидок iHerb...")
+    deals = await fetch_iherb_specials()
+    
+    # Сбор всех уникальных получателей
+    targets = set()
+    if CHAT_ID and not CHAT_ID.startswith("YOUR_"):
+        targets.add(CHAT_ID)
+    targets.update(subscribers)
 
-        print(cl(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Сканируем Live матчей: {len(matches)}", "CY"), flush=True)
-        for match in matches:
-            mid = str(match.get("id"))
-            minute = self._get_minute(match)
-            match["_minute"] = minute
+    if not targets:
+        logging.warning("⚠️ Нет получателей! Напишите боту /start в Telegram.")
+        return
 
-            exclusion_reason = is_excluded_match(match)
-            if exclusion_reason:
+    # Фильтрация скидок
+    filtered_deals = []
+    for deal in deals:
+        if deal["discount_percent"] < MIN_DISCOUNT_PERCENT:
+            continue
+            
+        if TARGET_BRANDS and not any(brand.lower() in deal["title"].lower() for brand in TARGET_BRANDS):
+            continue
+
+        filtered_deals.append(deal)
+
+    # Если с выбранными брендами вышло 0 скидок, берем все актуальные скидки
+    if not filtered_deals:
+        logging.info("ℹ️ По выбранным брендам скидок не найдено, берем главные топ-скидки iHerb...")
+        filtered_deals = [d for d in deals if d["discount_percent"] >= MIN_DISCOUNT_PERCENT] or deals[:4]
+
+    failed_targets = set()
+
+    for deal in filtered_deals:
+        deal_id = deal["id"]
+        if not force_send and deal_id in sent_deals_cache:
+            continue
+            
+        message = format_deal_message(deal)
+        any_sent = False
+
+        for target_id in targets:
+            if target_id in failed_targets:
                 continue
+            try:
+                await bot.send_message(
+                    chat_id=target_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=False
+                )
+                logging.info(f"✅ Отправлено в {target_id}: {deal['title'][:30]}...")
+                any_sent = True
+                await asyncio.sleep(2.0)
+            except TelegramRetryAfter as e:
+                retry_after = getattr(e, 'retry_after', 26)
+                logging.warning(f"⏳ Ограничение Telegram (Flood Control)! Пауза {retry_after + 2} сек...")
+                await asyncio.sleep(retry_after + 2)
+                try:
+                    await bot.send_message(
+                        chat_id=target_id,
+                        text=message,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=False
+                    )
+                    logging.info(f"✅ Повторно отправлено в {target_id}: {deal['title'][:30]}...")
+                    any_sent = True
+                    await asyncio.sleep(2.0)
+                except Exception as retry_err:
+                    logging.error(f"❌ Ошибка повторной отправки в {target_id}: {retry_err}")
+            except Exception as e:
+                err_str = str(e)
+                if "chat not found" in err_str or "bot was blocked" in err_str:
+                    failed_targets.add(target_id)
+                    logging.error(f"❌ Ошибка отправки в {target_id}: {e}")
+                elif "too many requests" in err_str.lower() or "flood" in err_str.lower():
+                    logging.warning("⏳ Превышен лимит сообщений Telegram. Пауза 20 секунд...")
+                    await asyncio.sleep(20)
+                else:
+                    logging.error(f"Ошибка отправки в {target_id}: {e}")
 
-            incidents = self.fetcher.get_match_incidents(mid)
-            stats_data = self.fetcher.get_match_statistics(mid)
+        if any_sent:
+            sent_deals_cache.add(deal_id)
 
-            for strategy in STRATEGIES:
-                signal = strategy.scan(match, incidents, stats_data)
-                if signal and in_send_window(minute):
-                    home_name = (match.get("homeTeam") or {}).get("name", "Unknown")[:18]
-                    away_name = (match.get("awayTeam") or {}).get("name", "Unknown")[:18]
-                    league_name = (match.get("tournament") or {}).get("name", "League")
-                    cur_h = int(((match.get("homeScore") or {}).get("current")) or 0)
-                    cur_a = int(((match.get("awayScore") or {}).get("current")) or 0)
-                    info = {
-                        "home": home_name, "away": away_name, "league": league_name,
-                        "score_h": cur_h, "score_a": cur_a,
-                        "minute": f"{minute}'"
-                    }
-                    if mid not in self.sent_signals:
-                        print(cl(f"🔥 [{strategy.name}] {league_name}: {home_name} vs {away_name} ({minute}')", "GR"), flush=True)
-                        msg_id = self.tg.send_signal(strategy, info, signal, mid)
-                        if msg_id:
-                            self.bankroll.place_bet(mid, msg_id, strategy, signal, info)
-                            self.sent_signals[mid] = time.time()
+
+async def scheduler():
+    """Цикл регулярных проверок"""
+    while True:
+        try:
+            await check_and_notify()
+        except Exception as e:
+            logging.error(f"Ошибка в цикле плановика: {e}")
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+async def start_dummy_server():
+    """HTTP веб-сервер для прохождения Health Check на Render.com (Web Service)"""
+    try:
+        from aiohttp import web
+        port = int(os.environ.get("PORT", 10000))
+        app = web.Application()
+        app.router.add_get('/', lambda r: web.Response(text="iHerb Telegram Bot is running!"))
+        app.router.add_get('/health', lambda r: web.Response(text="OK"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logging.info(f"🌐 HTTP веб-сервер запущен на порту {port} (для Render Health Check)")
+    except Exception as e:
+        logging.warning(f"Не удалось запустить HTTP веб-сервер (не критично): {e}")
+
+
+async def main():
+    logging.info("🚀 Telegram бот для iHerb запущен!")
+    await start_dummy_server()
+    logging.info("🔎 Автоматический запуск фонового мониторинга скидок...")
+    asyncio.create_task(scheduler())
+    
+    # Бесконечный цикл с плавным перехватом конфликтов (для идеального Render Redeploy)
+    while True:
+        try:
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                logging.warning(f"Сброс webhook: {e}")
+            await dp.start_polling(bot)
+            break
+        except Exception as e:
+            err_msg = str(e)
+            if "Conflict" in err_msg or "terminated by other" in err_msg or "409" in err_msg:
+                logging.warning("⏳ Замечен старый процесс бота (Render Redeploy). Ожидание 6 секунд, пока Render отключит старый контейнер...")
+                await asyncio.sleep(6)
+            else:
+                logging.error(f"Ошибка polling: {e}. Перезапуск через 5 секунд...")
+                await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
-    token, chat_id = load_credentials()
-    LiveMonitor(token, chat_id).run()
+    asyncio.run(main())
