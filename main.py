@@ -3,9 +3,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
-from html import escape
-from urllib.parse import urljoin
+from datetime import datetime
 
 import httpx
 from bs4 import BeautifulSoup
@@ -23,37 +21,70 @@ from aiogram.exceptions import TelegramRetryAfter
 
 
 # ============================================================
-# iHERB DEAL BOT — ПОЛНАЯ ОБНОВЛЁННАЯ ВЕРСИЯ
+# iHERB DEAL BOT — ПОЛНОСТЬЮ ОБНОВЛЁННАЯ ВЕРСИЯ
+# ============================================================
+#
+# ВАЖНО ДЛЯ RENDER:
+#
+# Файл должен называться:
+# main.py
+#
+# Start Command:
+# python main.py
+#
+# Бот:
+# 1. Проверяет iHerb сразу после запуска
+# 2. Потом проверяет каждые 5 минут
+# 3. Ищет реальные цены прямо в HTML
+# 4. Поддерживает цены в USD и KZT
+# 5. Берёт скидку из текста iHerb
+# 6. Не требует старой цены, если iHerb уже указал %
+# 7. Не отправляет один и тот же товар повторно
+# 8. Показывает живой статус проверки
+# 9. Удаляет неправильный CHAT_ID после ошибки
+# 10. При ручной проверке отправляет результаты заново
+#
+# ============================================================
+
+
+# ============================================================
+# НАСТРОЙКИ
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Проверка iHerb каждые 5 минут
 CHECK_INTERVAL_SECONDS = 300
 
-# Минимальная скидка
 MIN_DISCOUNT_PERCENT = 20
-
-# Максимальная скидка
 MAX_DISCOUNT_PERCENT = 90
 
-# Сколько новых товаров отправлять за одну автоматическую проверку
-MAX_DEALS_PER_CHECK = 10
-
-# Курс USD/KZT
 KZT_EXCHANGE_RATE = 540
-
-# Наценка
 MARGIN_MARKUP_PERCENT = 35
 
-# Файл памяти
-CACHE_FILE = "sent_deals.json"
+MAX_DEALS_PER_CHECK = 10
 
+CACHE_FILE = "sent_deals.json"
 MAX_CACHE_ITEMS = 5000
 
-# Бренды
+
+# ============================================================
+# БРЕНДЫ
+# ============================================================
+#
 # [] = ВСЕ БРЕНДЫ
+#
+# Например:
+#
+# TARGET_BRANDS = [
+#     "California Gold Nutrition",
+#     "NOW Foods",
+#     "Doctor's Best",
+#     "Solgar",
+# ]
+#
+# ============================================================
+
 TARGET_BRANDS = []
 
 
@@ -63,18 +94,13 @@ TARGET_BRANDS = []
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN не найден. "
-        "Добавьте BOT_TOKEN в Render → Environment Variables."
+        "BOT_TOKEN не найден в Render Environment Variables"
     )
 
 if not CHAT_ID:
-    logging_warning = (
-        "CHAT_ID не задан. "
-        "Бот будет использовать пользователей, "
-        "которые нажали /start."
+    raise RuntimeError(
+        "CHAT_ID не найден в Render Environment Variables"
     )
-else:
-    logging_warning = None
 
 
 # ============================================================
@@ -86,27 +112,18 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger(__name__)
-
-if logging_warning:
-    logger.warning("⚠️ " + logging_warning)
-
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
 bot = Bot(token=BOT_TOKEN)
+
 dp = Dispatcher()
 
 subscribers = set()
-sent_deals_cache = set()
 
-check_counter = 0
-last_check_time = None
-last_deals_found = 0
-last_deals_sent = 0
-bot_started_time = datetime.now(timezone.utc)
+sent_deals_cache = set()
 
 
 # ============================================================
@@ -118,10 +135,43 @@ main_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(text="🔥 Получить скидки"),
             KeyboardButton(text="ℹ️ Статус"),
-        ]
+        ],
+        [
+            KeyboardButton(text="🔄 Проверить сейчас"),
+        ],
     ],
     resize_keyboard=True,
 )
+
+
+# ============================================================
+# HTTP HEADERS
+# ============================================================
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/124.0.0.0 "
+        "Safari/537.36"
+    ),
+    "Accept-Language": (
+        "ru-RU,ru;q=0.9,"
+        "en-US;q=0.8,en;q=0.7"
+    ),
+    "Accept": (
+        "text/html,"
+        "application/xhtml+xml,"
+        "application/xml;q=0.9,"
+        "image/avif,"
+        "image/webp,"
+        "*/*;q=0.8"
+    ),
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 
 # ============================================================
@@ -129,17 +179,21 @@ main_keyboard = ReplyKeyboardMarkup(
 # ============================================================
 
 try:
+
     from curl_cffi import requests as curl_requests
 
     HAS_CURL_CFFI = True
 
-    logger.info("✅ curl_cffi доступен")
+    logging.info(
+        "✅ curl_cffi доступен"
+    )
 
 except ImportError:
+
     HAS_CURL_CFFI = False
 
-    logger.warning(
-        "⚠️ curl_cffi отсутствует. Используем httpx."
+    logging.warning(
+        "⚠️ curl_cffi отсутствует"
     )
 
 
@@ -154,39 +208,43 @@ def load_cache():
     try:
 
         if not os.path.exists(CACHE_FILE):
+
             sent_deals_cache = set()
 
-            logger.info("💾 Cache пока пустой")
+            logging.info(
+                "💾 Cache пуст"
+            )
+
             return
 
         with open(
             CACHE_FILE,
             "r",
-            encoding="utf-8"
+            encoding="utf-8",
         ) as f:
 
             data = json.load(f)
 
         if isinstance(data, list):
 
-            sent_deals_cache = {
+            sent_deals_cache = set(
                 str(x)
                 for x in data
-            }
+            )
 
         else:
 
             sent_deals_cache = set()
 
-        logger.info(
-            f"💾 Загружено товаров в cache: "
+        logging.info(
+            "💾 Загружено из cache: "
             f"{len(sent_deals_cache)}"
         )
 
     except Exception as e:
 
-        logger.error(
-            f"❌ Ошибка загрузки cache: {e}"
+        logging.error(
+            f"❌ Ошибка cache: {e}"
         )
 
         sent_deals_cache = set()
@@ -203,58 +261,21 @@ def save_cache():
         with open(
             CACHE_FILE,
             "w",
-            encoding="utf-8"
+            encoding="utf-8",
         ) as f:
 
             json.dump(
                 data,
                 f,
                 ensure_ascii=False,
-                indent=2
+                indent=2,
             )
 
     except Exception as e:
 
-        logger.error(
+        logging.error(
             f"❌ Ошибка сохранения cache: {e}"
         )
-
-
-# ============================================================
-# HTTP HEADERS
-# ============================================================
-
-HEADERS = {
-
-    "User-Agent": (
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/124.0.0.0 "
-        "Safari/537.36"
-    ),
-
-    "Accept-Language": (
-        "ru-RU,ru;q=0.9,"
-        "en-US;q=0.8,en;q=0.7"
-    ),
-
-    "Accept": (
-        "text/html,"
-        "application/xhtml+xml,"
-        "application/xml;q=0.9,"
-        "image/avif,"
-        "image/webp,"
-        "*/*;q=0.8"
-    ),
-
-    "Cache-Control": "no-cache",
-
-    "Pragma": "no-cache",
-
-    "Upgrade-Insecure-Requests": "1",
-}
 
 
 # ============================================================
@@ -269,7 +290,7 @@ def clean_text(text):
     return re.sub(
         r"\s+",
         " ",
-        str(text)
+        str(text),
     ).strip()
 
 
@@ -296,7 +317,7 @@ def safe_float(value):
         text = re.sub(
             r"[^\d.]",
             "",
-            text
+            text,
         )
 
         if not text:
@@ -320,95 +341,70 @@ def safe_float(value):
 
 def extract_prices(text):
 
-    """
-    Расширенный поиск цен.
-
-    Поддерживает:
-
-    $12.99
-    $ 12.99
-    US$12.99
-    USD 12.99
-    12.99 USD
-    12.99 $
-    12,99 $
-    """
-
     if not text:
         return []
 
-    text = (
-        str(text)
-        .replace("\xa0", " ")
-        .replace("US$", "$")
+    text = str(text)
+
+    text = text.replace(
+        "\xa0",
+        " ",
     )
-
-    patterns = [
-
-        r"\$\s*(\d+(?:[.,]\d{1,2})?)",
-
-        r"USD\s*(\d+(?:[.,]\d{1,2})?)",
-
-        r"(\d+(?:[.,]\d{1,2})?)\s*USD",
-
-        r"(\d+(?:[.,]\d{1,2})?)\s*\$",
-
-        r"\bprice\s*[:=]?\s*(\d+(?:[.,]\d{1,2})?)",
-
-        r'"price"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)',
-
-        r'"price"\s*:\s*(\d+(?:\.\d+)?)',
-
-        r'"salePrice"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)',
-
-        r'"sale_price"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)',
-
-        r'"currentPrice"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)',
-
-        r'"originalPrice"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)',
-
-        r'"listPrice"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)',
-
-        r'"discountPrice"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)',
-    ]
 
     result = []
 
+    patterns = [
+
+        # USD
+        r"(?:US\s*\$|USD|\$)\s*"
+        r"(\d+(?:[.,]\d{1,2})?)",
+
+        r"(\d+(?:[.,]\d{1,2})?)"
+        r"\s*(?:US\s*\$|USD|\$)",
+
+        # KZT
+        r"(?:₸|KZT)\s*"
+        r"(\d[\d\s]*(?:[.,]\d{1,2})?)",
+
+        r"(\d[\d\s]*(?:[.,]\d{1,2})?)"
+        r"\s*(?:₸|KZT)",
+
+    ]
+
     for pattern in patterns:
 
-        try:
+        matches = re.findall(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
 
-            matches = re.findall(
-                pattern,
-                text,
-                re.IGNORECASE
+        for value in matches:
+
+            value = (
+                str(value)
+                .replace(" ", "")
             )
 
-            for value in matches:
+            number = safe_float(
+                value
+            )
 
-                number = safe_float(value)
+            if number is None:
+                continue
 
-                if number is None:
-                    continue
+            if number > 1000000:
+                continue
 
-                # Отбрасываем явно неценовые значения
-                if number > 1000:
-                    continue
-
-                if number < 0.50:
-                    continue
-
-                if number not in result:
-                    result.append(number)
-
-        except Exception:
-            pass
+            result.append(
+                number
+            )
 
     return result
 
 
 # ============================================================
-# DISCOUNT
+# СКИДКА
 # ============================================================
 
 def extract_discount_percent(text):
@@ -416,7 +412,9 @@ def extract_discount_percent(text):
     if not text:
         return None
 
-    text = clean_text(text)
+    text = clean_text(
+        text
+    )
 
     patterns = [
 
@@ -424,45 +422,45 @@ def extract_discount_percent(text):
 
         r"(\d{1,2})\s*%\s*discount",
 
-        r"-\s*(\d{1,2})\s*%",
-
         r"(\d{1,2})\s*%\s*скид",
 
-        r"скидк[аи]?\s*(?:до\s*)?(\d{1,2})\s*%",
+        r"скидк[аи]?"
+        r"\s*(?:до\s*)?"
+        r"(\d{1,2})\s*%",
 
         r"save\s+(\d{1,2})\s*%",
 
-        r"(\d{1,2})\s*%\s*эконом",
+        r"-\s*(\d{1,2})\s*%",
+
+        r"(\d{1,2})\s*%\s*",
 
     ]
 
     for pattern in patterns:
 
-        match = re.search(
+        matches = re.findall(
             pattern,
             text,
-            re.IGNORECASE
+            re.IGNORECASE,
         )
 
-        if not match:
-            continue
+        for match in matches:
 
-        try:
+            try:
 
-            value = int(
-                match.group(1)
-            )
+                value = int(match)
 
-            if (
-                MIN_DISCOUNT_PERCENT
-                <= value
-                <= MAX_DISCOUNT_PERCENT
-            ):
+                if (
+                    MIN_DISCOUNT_PERCENT
+                    <= value
+                    <= MAX_DISCOUNT_PERCENT
+                ):
 
-                return value
+                    return value
 
-        except Exception:
-            pass
+            except Exception:
+
+                continue
 
     return None
 
@@ -476,29 +474,39 @@ def normalize_url(url):
     if not url:
         return ""
 
-    url = str(url).strip()
+    url = str(
+        url
+    ).strip()
 
     if url.startswith("//"):
+
         return "https:" + url
 
     if url.startswith("/"):
+
         return (
             "https://www.iherb.com"
             + url
         )
 
-    if url.startswith("http://"):
+    if url.startswith(
+        "http://"
+    ):
+
         return (
             "https://"
             + url[7:]
         )
 
-    if url.startswith("https://"):
+    if url.startswith(
+        "https://"
+    ):
+
         return url
 
-    return urljoin(
-        "https://www.iherb.com/",
-        url
+    return (
+        "https://www.iherb.com/"
+        + url.lstrip("/")
     )
 
 
@@ -513,13 +521,9 @@ def extract_product_id(link):
 
     patterns = [
 
-        r"/(\d+)$",
-
-        r"/(\d+)\?",
+        r"/(\d+)(?:\?|$)",
 
         r"/pr/[^/]+/(\d+)",
-
-        r"/pr/[^/]+/(\d+)/",
 
         r"/product/[^/]+/(\d+)",
 
@@ -529,10 +533,12 @@ def extract_product_id(link):
 
         match = re.search(
             pattern,
-            link
+            link,
+            re.IGNORECASE,
         )
 
         if match:
+
             return match.group(1)
 
     return link
@@ -545,9 +551,10 @@ def extract_product_id(link):
 def find_brand(title):
 
     if not title:
-        return ""
+        return "iHerb"
 
     if not TARGET_BRANDS:
+
         return "iHerb"
 
     title_lower = title.lower()
@@ -555,227 +562,14 @@ def find_brand(title):
     for brand in TARGET_BRANDS:
 
         if brand.lower() in title_lower:
+
             return brand
 
     return ""
 
 
 # ============================================================
-# PRICE ELEMENTS
-# ============================================================
-
-def get_card_price_texts(card):
-
-    selectors = [
-
-        ".price",
-
-        ".price-discount",
-
-        ".price-original",
-
-        ".price-old",
-
-        ".original-price",
-
-        ".discount-price",
-
-        ".product-price",
-
-        "[class*='price']",
-
-        "[class*='Price']",
-
-        "[data-qa*='price']",
-
-        "[data-testid*='price']",
-
-        "[data-price]",
-
-        "[data-sale-price]",
-
-        "[data-original-price]",
-
-    ]
-
-    texts = []
-
-    for selector in selectors:
-
-        try:
-
-            elements = card.select(
-                selector
-            )
-
-            for element in elements:
-
-                text = clean_text(
-                    element.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-                if text:
-                    texts.append(text)
-
-                # Считываем data-* атрибуты
-                for attr in [
-                    "data-price",
-                    "data-sale-price",
-                    "data-original-price",
-                    "data-current-price",
-                    "data-discount-price",
-                ]:
-
-                    value = element.get(
-                        attr
-                    )
-
-                    if value:
-                        texts.append(
-                            str(value)
-                        )
-
-        except Exception:
-            pass
-
-    return texts
-
-
-# ============================================================
-# JSON / DATA
-# ============================================================
-
-def extract_json_price_data(card):
-
-    prices = []
-    discount = None
-
-    try:
-
-        for element in card.find_all():
-
-            for key, value in element.attrs.items():
-
-                if isinstance(value, list):
-                    value = " ".join(
-                        str(x)
-                        for x in value
-                    )
-
-                if not isinstance(
-                    value,
-                    str
-                ):
-                    continue
-
-                key_lower = key.lower()
-
-                if (
-                    "price" in key_lower
-                    or "cost" in key_lower
-                ):
-
-                    prices.extend(
-                        extract_prices(value)
-                    )
-
-                if (
-                    "discount" in key_lower
-                    or "percent" in key_lower
-                ):
-
-                    found = (
-                        extract_discount_percent(
-                            value
-                        )
-                    )
-
-                    if found:
-                        discount = found
-
-    except Exception:
-        pass
-
-    return prices, discount
-
-
-# ============================================================
-# BEST PRICES
-# ============================================================
-
-def find_best_prices(price_values):
-
-    if not price_values:
-        return None, None
-
-    unique = sorted(
-        set(
-            round(
-                float(x),
-                2
-            )
-            for x in price_values
-            if x and x > 0
-        )
-    )
-
-    if not unique:
-        return None, None
-
-    if len(unique) == 1:
-        return unique[0], None
-
-    current_price = unique[0]
-    old_price = unique[-1]
-
-    if old_price <= current_price:
-        old_price = None
-
-    return current_price, old_price
-
-
-# ============================================================
-# CALCULATE DISCOUNT
-# ============================================================
-
-def calculate_discount(
-    old_price,
-    current_price
-):
-
-    if not old_price:
-        return None
-
-    if not current_price:
-        return None
-
-    if old_price <= current_price:
-        return None
-
-    percent = (
-        1
-        - (
-            current_price
-            / old_price
-        )
-    ) * 100
-
-    percent = round(percent)
-
-    if percent < MIN_DISCOUNT_PERCENT:
-        return percent
-
-    if percent > MAX_DISCOUNT_PERCENT:
-        return None
-
-    return percent
-
-
-# ============================================================
-# iHERB HTML
+# HTML
 # ============================================================
 
 async def get_iherb_html():
@@ -786,19 +580,19 @@ async def get_iherb_html():
 
         "https://www.iherb.com/deals",
 
-        "https://kz.iherb.com/c/specials",
+        "https://kz.iherb.com/deals?soa=false",
 
-        "https://www.iherb.com/c/specials",
+        "https://www.iherb.com/deals?soa=false",
 
     ]
 
     cookies = {
 
         "ih-pref":
-            "lan=ru-RU&currency=USD&country=KZ",
+            "lan=ru-RU&currency=KZT&country=KZ",
 
         "iherb-pref":
-            "lan=ru-RU&currency=USD&country=KZ",
+            "lan=ru-RU&currency=KZT&country=KZ",
 
     }
 
@@ -808,18 +602,13 @@ async def get_iherb_html():
 
     if HAS_CURL_CFFI:
 
-        browsers = [
-
-            "chrome124",
-            "chrome120",
-            "chrome116",
-            "safari15_5",
-
-        ]
-
         for url in urls:
 
-            for browser in browsers:
+            for browser in [
+                "chrome124",
+                "chrome120",
+                "chrome116",
+            ]:
 
                 try:
 
@@ -830,13 +619,14 @@ async def get_iherb_html():
                             headers=HEADERS,
                             cookies=cookies,
                             impersonate=browser,
-                            timeout=30,
+                            timeout=40,
                         )
                     )
 
-                    logger.info(
-                        f"iHerb | {browser} | "
-                        f"HTTP {response.status_code} | "
+                    logging.info(
+                        "🌐 iHerb "
+                        f"{browser} "
+                        f"HTTP {response.status_code} "
                         f"{len(response.text)} chars"
                     )
 
@@ -845,15 +635,15 @@ async def get_iherb_html():
                         and len(response.text) > 10000
                     ):
 
-                        logger.info(
-                            "✅ iHerb HTML получен"
+                        logging.info(
+                            "✅ HTML iHerb получен"
                         )
 
                         return response.text
 
                 except Exception as e:
 
-                    logger.debug(
+                    logging.warning(
                         f"curl error: {e}"
                     )
 
@@ -866,7 +656,7 @@ async def get_iherb_html():
         try:
 
             async with httpx.AsyncClient(
-                timeout=30,
+                timeout=40,
                 headers=HEADERS,
                 cookies=cookies,
                 follow_redirects=True,
@@ -876,9 +666,9 @@ async def get_iherb_html():
                     url
                 )
 
-                logger.info(
-                    f"httpx | HTTP "
-                    f"{response.status_code} | "
+                logging.info(
+                    "🌐 httpx "
+                    f"HTTP {response.status_code} "
                     f"{len(response.text)} chars"
                 )
 
@@ -887,21 +677,13 @@ async def get_iherb_html():
                     and len(response.text) > 10000
                 ):
 
-                    logger.info(
-                        "✅ HTML получен через httpx"
-                    )
-
                     return response.text
 
         except Exception as e:
 
-            logger.debug(
+            logging.warning(
                 f"httpx error: {e}"
             )
-
-    logger.error(
-        "❌ iHerb HTML получить не удалось"
-    )
 
     return ""
 
@@ -914,27 +696,32 @@ def find_product_cards(soup):
 
     selectors = [
 
+        # Основные
+        "[data-qa='product-card']",
+
         ".product-cell-container",
 
         "[class*='product-cell-container']",
 
-        ".product-inner",
-
-        ".product-card",
-
-        "[data-qa='product-card']",
-
-        ".product-tile",
-
+        # Новые варианты
         "[class*='product-card']",
 
         "[class*='ProductCard']",
 
-        "[data-product-id]",
+        "[class*='product-cell']",
+
+        "[class*='ProductCell']",
+
+        # Дополнительные
+        ".product-inner",
+
+        ".product-tile",
 
     ]
 
     cards = []
+
+    seen = set()
 
     for selector in selectors:
 
@@ -944,70 +731,66 @@ def find_product_cards(soup):
                 selector
             )
 
-            if found:
-
-                logger.info(
-                    f"🔍 {selector}: "
-                    f"{len(found)} карточек"
-                )
-
-                cards.extend(found)
-
-                if len(found) >= 30:
-                    break
-
         except Exception:
-            pass
 
-    unique = []
-
-    seen = set()
-
-    for card in cards:
-
-        text = clean_text(
-            card.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not text:
             continue
 
-        link = ""
+        if not found:
+            continue
 
-        link_element = card.select_one(
-            "a[href]"
+        logging.info(
+            f"🔍 {selector}: "
+            f"{len(found)}"
         )
 
-        if link_element:
+        for card in found:
 
-            link = normalize_url(
-                link_element.get(
-                    "href",
-                    ""
+            text = clean_text(
+                card.get_text(
+                    " ",
+                    strip=True,
                 )
             )
 
-        key = (
-            link
-            + "|"
-            + text[:500]
-        )
+            if len(text) < 20:
+                continue
 
-        if key in seen:
-            continue
+            links = card.select(
+                "a[href]"
+            )
 
-        seen.add(key)
-        unique.append(card)
+            link = ""
 
-    logger.info(
-        f"📦 Уникальных карточек: "
-        f"{len(unique)}"
+            if links:
+
+                link = normalize_url(
+                    links[0].get(
+                        "href",
+                        "",
+                    )
+                )
+
+            key = (
+                link
+                + "|"
+                + text[:500]
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            cards.append(
+                card
+            )
+
+    logging.info(
+        f"📦 Всего уникальных карточек: "
+        f"{len(cards)}"
     )
 
-    return unique
+    return cards
 
 
 # ============================================================
@@ -1024,11 +807,15 @@ def extract_title(card):
 
         "[class*='ProductTitle']",
 
-        "[class*='title']",
+        "[class*='product-name']",
 
-        "[class*='Title']",
+        "[class*='ProductName']",
 
-        "[data-qa*='title']",
+        "[data-qa*='product-name']",
+
+        "h2",
+
+        "h3",
 
     ]
 
@@ -1042,59 +829,65 @@ def extract_title(card):
 
             if element:
 
-                title = clean_text(
+                text = clean_text(
                     element.get_text(
                         " ",
-                        strip=True
+                        strip=True,
                     )
                 )
 
-                if len(title) >= 3:
-                    return title
+                if len(text) >= 5:
+
+                    return text
 
         except Exception:
+
             pass
 
-    # alt/title
+    # alt изображения
     try:
 
-        for element in card.select(
-            "[title]"
-        ):
+        images = card.select(
+            "img[alt]"
+        )
 
-            value = clean_text(
-                element.get(
-                    "title",
-                    ""
+        for image in images:
+
+            alt = clean_text(
+                image.get(
+                    "alt",
+                    "",
                 )
             )
 
-            if len(value) >= 10:
-                return value
+            if len(alt) >= 10:
+
+                return alt
 
     except Exception:
+
         pass
 
-    # ссылка
+    # Ссылки
     try:
 
-        links = card.select(
+        for link in card.select(
             "a[href]"
-        )
-
-        for link in links:
+        ):
 
             text = clean_text(
                 link.get_text(
                     " ",
-                    strip=True
+                    strip=True,
                 )
             )
 
-            if len(text) >= 10:
+            if len(text) >= 15:
+
                 return text
 
     except Exception:
+
         pass
 
     return ""
@@ -1112,7 +905,7 @@ def extract_link(card):
 
         "a[href*='/product/']",
 
-        "a.absolute-link",
+        "a[href*='/deals/']",
 
         "a[href]",
 
@@ -1129,26 +922,331 @@ def extract_link(card):
             if not element:
                 continue
 
-            href = element.get(
-                "href",
-                ""
-            )
-
             href = normalize_url(
-                href
+                element.get(
+                    "href",
+                    "",
+                )
             )
 
             if (
-                href
-                and "iherb.com" in href
+                "iherb.com"
+                in href
             ):
 
                 return href
 
         except Exception:
+
             pass
 
     return ""
+
+
+# ============================================================
+# PRICE FROM ATTRIBUTES
+# ============================================================
+
+def extract_attribute_prices(card):
+
+    prices = []
+
+    discount = None
+
+    try:
+
+        for element in card.find_all():
+
+            for key, value in element.attrs.items():
+
+                if isinstance(
+                    value,
+                    list,
+                ):
+
+                    value = " ".join(
+                        str(x)
+                        for x in value
+                    )
+
+                if not isinstance(
+                    value,
+                    str,
+                ):
+
+                    continue
+
+                key_lower = key.lower()
+
+                if (
+                    "price"
+                    in key_lower
+                    or "amount"
+                    in key_lower
+                    or "sale"
+                    in key_lower
+                    or "cost"
+                    in key_lower
+                ):
+
+                    prices.extend(
+                        extract_prices(
+                            value
+                        )
+                    )
+
+                if (
+                    "discount"
+                    in key_lower
+                    or "percent"
+                    in key_lower
+                ):
+
+                    found = (
+                        extract_discount_percent(
+                            value
+                        )
+                    )
+
+                    if found:
+
+                        discount = found
+
+    except Exception:
+
+        pass
+
+    return prices, discount
+
+
+# ============================================================
+# PRICE ELEMENTS
+# ============================================================
+
+def extract_element_prices(card):
+
+    prices = []
+
+    selectors = [
+
+        "[class*='price']",
+
+        "[class*='Price']",
+
+        "[data-qa*='price']",
+
+        "[data-testid*='price']",
+
+        "[aria-label*='$']",
+
+        "[aria-label*='₸']",
+
+    ]
+
+    for selector in selectors:
+
+        try:
+
+            elements = card.select(
+                selector
+            )
+
+            for element in elements:
+
+                text = clean_text(
+                    element.get_text(
+                        " ",
+                        strip=True,
+                    )
+                )
+
+                if text:
+
+                    prices.extend(
+                        extract_prices(
+                            text
+                        )
+                    )
+
+                for attr in [
+                    "aria-label",
+                    "data-price",
+                    "data-value",
+                    "content",
+                    "value",
+                ]:
+
+                    value = element.get(
+                        attr
+                    )
+
+                    if value:
+
+                        prices.extend(
+                            extract_prices(
+                                str(value)
+                            )
+                        )
+
+        except Exception:
+
+            pass
+
+    return prices
+
+
+# ============================================================
+# FIND CURRENT + OLD
+# ============================================================
+
+def find_prices(card):
+
+    prices = []
+
+    # 1
+    p1, _ = extract_attribute_prices(
+        card
+    )
+
+    prices.extend(
+        p1
+    )
+
+    # 2
+    prices.extend(
+        extract_element_prices(
+            card
+        )
+    )
+
+    # 3 полный текст
+    text = clean_text(
+        card.get_text(
+            " ",
+            strip=True,
+        )
+    )
+
+    prices.extend(
+        extract_prices(
+            text
+        )
+    )
+
+    # Уникальные
+    unique = []
+
+    for price in prices:
+
+        price = round(
+            price,
+            2,
+        )
+
+        if price <= 0:
+            continue
+
+        if price not in unique:
+
+            unique.append(
+                price
+            )
+
+    unique.sort()
+
+    if not unique:
+
+        return None, None
+
+    # Если только одна цена
+    if len(unique) == 1:
+
+        return unique[0], None
+
+    return (
+        unique[0],
+        unique[-1],
+    )
+
+
+# ============================================================
+# CONVERT KZT -> USD
+# ============================================================
+
+def normalize_price_pair(
+    current,
+    old,
+    card_text,
+):
+
+    if not current:
+        return None, None
+
+    # Если цены выглядят как KZT
+    if current > 1000:
+
+        current_usd = (
+            current
+            / KZT_EXCHANGE_RATE
+        )
+
+        old_usd = None
+
+        if old:
+
+            old_usd = (
+                old
+                / KZT_EXCHANGE_RATE
+            )
+
+        return (
+            round(current_usd, 2),
+            round(old_usd, 2)
+            if old_usd
+            else None,
+        )
+
+    return (
+        round(current, 2),
+        round(old, 2)
+        if old
+        else None,
+    )
+
+
+# ============================================================
+# CALCULATE DISCOUNT
+# ============================================================
+
+def calculate_discount(
+    old,
+    current,
+):
+
+    if not old or not current:
+        return None
+
+    if old <= current:
+        return None
+
+    value = (
+        1
+        - current / old
+    ) * 100
+
+    value = round(
+        value
+    )
+
+    if (
+        MIN_DISCOUNT_PERCENT
+        <= value
+        <= MAX_DISCOUNT_PERCENT
+    ):
+
+        return value
+
+    return None
 
 
 # ============================================================
@@ -1157,7 +1255,7 @@ def extract_link(card):
 
 def parse_product_card(
     card,
-    index
+    index,
 ):
 
     try:
@@ -1165,11 +1263,11 @@ def parse_product_card(
         card_text = clean_text(
             card.get_text(
                 " ",
-                strip=True
+                strip=True,
             )
         )
 
-        if not card_text:
+        if len(card_text) < 20:
             return None
 
         title = extract_title(
@@ -1177,12 +1275,6 @@ def parse_product_card(
         )
 
         if not title:
-
-            logger.info(
-                f"⏭ CARD #{index}: "
-                "название не найдено"
-            )
-
             return None
 
         link = extract_link(
@@ -1190,12 +1282,6 @@ def parse_product_card(
         )
 
         if not link:
-
-            logger.info(
-                f"⏭ {title[:60]} | "
-                "ссылка не найдена"
-            )
-
             return None
 
         # ====================================================
@@ -1214,188 +1300,125 @@ def parse_product_card(
             return None
 
         # ====================================================
-        # PRICE COLLECTION
-        # ====================================================
-
-        price_values = []
-
-        # 1
-        for text in get_card_price_texts(card):
-
-            price_values.extend(
-                extract_prices(text)
-            )
-
-        # 2
-        json_prices, json_discount = (
-            extract_json_price_data(card)
-        )
-
-        price_values.extend(
-            json_prices
-        )
-
-        # 3
-        # Полный текст
-        price_values.extend(
-            extract_prices(card_text)
-        )
-
-        # ====================================================
-        # ВАЖНЫЙ БЛОК:
-        # Ищем цены в HTML всего блока
-        # ====================================================
-
-        try:
-
-            raw_html = str(card)
-
-            price_values.extend(
-                extract_prices(raw_html)
-            )
-
-        except Exception:
-            pass
-
-        # ====================================================
-        # UNIQUE
-        # ====================================================
-
-        unique_prices = []
-
-        for price in price_values:
-
-            price = round(
-                float(price),
-                2
-            )
-
-            if (
-                price not in unique_prices
-                and 0.5 <= price <= 1000
-            ):
-
-                unique_prices.append(
-                    price
-                )
-
-        unique_prices.sort()
-
-        current_price, old_price = (
-            find_best_prices(
-                unique_prices
-            )
-        )
-
-        # ====================================================
         # DISCOUNT
         # ====================================================
 
-        text_discount = (
+        discount = (
             extract_discount_percent(
                 card_text
             )
         )
 
-        discount_percent = (
-            text_discount
-            or json_discount
-        )
-
-        calculated_discount = (
-            calculate_discount(
-                old_price,
-                current_price
+        attribute_prices, attribute_discount = (
+            extract_attribute_prices(
+                card
             )
         )
 
-        if calculated_discount:
+        if not discount:
+            discount = attribute_discount
+
+        # ====================================================
+        # PRICES
+        # ====================================================
+
+        current, old = find_prices(
+            card
+        )
+
+        current_usd, old_usd = (
+            normalize_price_pair(
+                current,
+                old,
+                card_text,
+            )
+        )
+
+        # ====================================================
+        # CALCULATED DISCOUNT
+        # ====================================================
+
+        calculated = calculate_discount(
+            old_usd,
+            current_usd,
+        )
+
+        if calculated:
 
             if (
-                discount_percent is None
-                or calculated_discount
-                > discount_percent
+                not discount
+                or calculated > discount
             ):
 
-                discount_percent = (
-                    calculated_discount
-                )
+                discount = calculated
+
+        # ====================================================
+        # ВАЖНО:
+        #
+        # iHerb иногда показывает:
+        #
+        # $27.89 $39.84
+        # 30% off
+        #
+        # Иногда парсер видит только:
+        #
+        # $27.89
+        # 30% off
+        #
+        # Поэтому если есть скидка,
+        # рассчитываем старую цену.
+        # ====================================================
+
+        if (
+            discount
+            and current_usd
+            and not old_usd
+        ):
+
+            old_usd = round(
+                current_usd
+                / (
+                    1
+                    - discount / 100
+                ),
+                2,
+            )
 
         # ====================================================
         # DEBUG
         # ====================================================
 
-        logger.info(
-            f"🔎 CARD #{index} | "
-            f"{title[:65]} | "
-            f"prices={unique_prices[:15]} | "
-            f"discount_text={text_discount} | "
-            f"discount_json={json_discount} | "
-            f"discount_calc={calculated_discount}"
+        logging.info(
+            f"🔎 #{index} | "
+            f"{title[:70]} | "
+            f"current={current_usd} | "
+            f"old={old_usd} | "
+            f"discount={discount}"
         )
 
         # ====================================================
-        # PRICE NOT FOUND
+        # FILTER
         # ====================================================
 
-        if not current_price:
+        if not current_usd:
 
-            logger.info(
+            logging.info(
                 f"⏭ {title[:65]} | "
                 "цена не найдена"
             )
 
             return None
 
-        # ====================================================
-        # DISCOUNT NOT FOUND
-        # ====================================================
+        if not discount:
 
-        if not discount_percent:
-
-            logger.info(
+            logging.info(
                 f"⏭ {title[:65]} | "
-                f"${current_price:.2f} | "
-                "скидка не определена"
+                "скидка не найдена"
             )
 
             return None
 
-        # ====================================================
-        # MIN DISCOUNT
-        # ====================================================
-
-        if (
-            discount_percent
-            < MIN_DISCOUNT_PERCENT
-        ):
-
-            return None
-
-        # ====================================================
-        # OLD PRICE
-        # ====================================================
-
-        if not old_price:
-
-            # Если есть процент скидки,
-            # восстанавливаем старую цену
-            if discount_percent > 0:
-
-                old_price = round(
-                    current_price
-                    / (
-                        1
-                        - discount_percent / 100
-                    ),
-                    2
-                )
-
-        if not old_price:
-
-            return None
-
-        if old_price <= current_price:
+        if discount < MIN_DISCOUNT_PERCENT:
 
             return None
 
@@ -1403,14 +1426,9 @@ def parse_product_card(
         # ID
         # ====================================================
 
-        product_id = (
-            extract_product_id(
-                link
-            )
+        product_id = extract_product_id(
+            link
         )
-
-        if not product_id:
-            product_id = link
 
         # ====================================================
         # DEAL
@@ -1418,7 +1436,7 @@ def parse_product_card(
 
         deal = {
 
-            "id": str(product_id),
+            "id": product_id,
 
             "title": title,
 
@@ -1429,73 +1447,79 @@ def parse_product_card(
             ),
 
             "orig_price_usd": round(
-                old_price,
-                2
+                old_usd,
+                2,
             ),
 
             "discount_price_usd": round(
-                current_price,
-                2
+                current_usd,
+                2,
             ),
 
             "discount_percent": int(
-                discount_percent
+                discount
             ),
 
             "link": link,
+
         }
 
-        logger.info(
-            f"🔥 ПРОШЁЛ ФИЛЬТР | "
-            f"-{deal['discount_percent']}% | "
-            f"${deal['discount_price_usd']:.2f} | "
-            f"{deal['title'][:70]}"
+        logging.info(
+            "🔥 DEAL | "
+            f"-{discount}% | "
+            f"${current_usd:.2f} | "
+            f"{title[:80]}"
         )
 
         return deal
 
     except Exception as e:
 
-        logger.exception(
-            f"❌ CARD #{index}: {e}"
+        logging.exception(
+            f"❌ Ошибка карточки #{index}: {e}"
         )
 
         return None
 
 
 # ============================================================
-# FETCH SPECIALS
+# FETCH DEALS
 # ============================================================
 
 async def fetch_iherb_specials():
 
-    logger.info(
+    logging.info(
         "=" * 60
     )
 
-    logger.info(
+    logging.info(
         "🔎 НАЧИНАЕМ ПРОВЕРКУ iHERB"
     )
 
-    logger.info(
+    logging.info(
         f"🎯 Минимальная скидка: "
         f"{MIN_DISCOUNT_PERCENT}%"
     )
 
-    logger.info(
+    logging.info(
         "=" * 60
     )
 
     html = await get_iherb_html()
 
     if not html:
+
+        logging.error(
+            "❌ HTML iHerb не получен"
+        )
+
         return []
 
     try:
 
         soup = BeautifulSoup(
             html,
-            "html.parser"
+            "html.parser",
         )
 
         cards = find_product_cards(
@@ -1506,15 +1530,16 @@ async def fetch_iherb_specials():
 
         for index, card in enumerate(
             cards,
-            start=1
+            start=1,
         ):
 
             deal = parse_product_card(
                 card,
-                index
+                index,
             )
 
             if deal:
+
                 deals.append(
                     deal
                 )
@@ -1523,16 +1548,16 @@ async def fetch_iherb_specials():
         # UNIQUE
         # ====================================================
 
-        unique_deals = {}
+        unique = {}
 
         for deal in deals:
 
-            unique_deals[
+            unique[
                 deal["id"]
             ] = deal
 
         deals = list(
-            unique_deals.values()
+            unique.values()
         )
 
         # ====================================================
@@ -1542,29 +1567,33 @@ async def fetch_iherb_specials():
         deals.sort(
             key=lambda x: (
                 x["discount_percent"],
-                -x["discount_price_usd"]
+                x["discount_price_usd"],
             ),
-            reverse=True
+            reverse=True,
         )
 
-        logger.info(
+        logging.info(
             "=" * 60
         )
 
-        logger.info(
-            f"🔥 НАЙДЕНО СКИДОК: "
+        logging.info(
+            "🔥 РЕЗУЛЬТАТ ПРОВЕРКИ"
+        )
+
+        logging.info(
+            "🔥 Подходящих товаров: "
             f"{len(deals)}"
         )
 
         for deal in deals[:20]:
 
-            logger.info(
+            logging.info(
                 f"💊 -{deal['discount_percent']}% | "
                 f"${deal['discount_price_usd']:.2f} | "
-                f"{deal['title'][:80]}"
+                f"{deal['title'][:70]}"
             )
 
-        logger.info(
+        logging.info(
             "=" * 60
         )
 
@@ -1572,7 +1601,7 @@ async def fetch_iherb_specials():
 
     except Exception as e:
 
-        logger.exception(
+        logging.exception(
             f"❌ Ошибка парсинга: {e}"
         )
 
@@ -1580,60 +1609,55 @@ async def fetch_iherb_specials():
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# FORMAT TELEGRAM
 # ============================================================
 
-def format_deal_message(deal):
+def format_deal_message(
+    deal
+):
 
-    title = escape(
+    title = (
         deal["title"]
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
     )
 
-    brand = escape(
+    brand = (
         deal["brand"]
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
     )
 
-    old_usd = deal[
-        "orig_price_usd"
-    ]
+    old_usd = (
+        deal["orig_price_usd"]
+    )
 
-    current_usd = deal[
-        "discount_price_usd"
-    ]
+    current_usd = (
+        deal["discount_price_usd"]
+    )
 
-    percent = deal[
-        "discount_percent"
-    ]
-
-    link = deal["link"]
-
-    # ========================================================
-    # COST
-    # ========================================================
+    percent = (
+        deal["discount_percent"]
+    )
 
     cost_kzt = round(
         current_usd
         * KZT_EXCHANGE_RATE
     )
 
-    # ========================================================
-    # SELL
-    # ========================================================
-
-    resell_price_kzt = round(
+    sale_kzt = round(
         cost_kzt
         * (
             1
-            + MARGIN_MARKUP_PERCENT / 100
+            + MARGIN_MARKUP_PERCENT
+            / 100
         )
     )
 
-    # ========================================================
-    # PROFIT
-    # ========================================================
-
     profit_kzt = (
-        resell_price_kzt
+        sale_kzt
         - cost_kzt
     )
 
@@ -1642,8 +1666,8 @@ def format_deal_message(deal):
         .replace(",", " ")
     )
 
-    resell_str = (
-        f"{resell_price_kzt:,}"
+    sale_str = (
+        f"{sale_kzt:,}"
         .replace(",", " ")
     )
 
@@ -1652,35 +1676,48 @@ def format_deal_message(deal):
         .replace(",", " ")
     )
 
+    now = datetime.now().strftime(
+        "%d.%m.%Y %H:%M"
+    )
+
     message = (
 
-        "🔥 <b>НОВАЯ СКИДКА iHERB</b> 🔥\n\n"
+        "🔥 <b>НОВАЯ СКИДКА iHERB</b> 🔥\n"
+        "\n"
 
-        f"🏷 <b>Бренд:</b> {brand}\n\n"
+        f"🏷 <b>Бренд:</b> {brand}\n"
+        "\n"
 
         f"💊 <b>Товар:</b>\n"
-        f"{title}\n\n"
+        f"{title}\n"
+        "\n"
 
-        f"📉 <b>СКИДКА: -{percent}%</b>\n\n"
+        f"📉 <b>СКИДКА: -{percent}%</b>\n"
+        "\n"
 
         f"💰 <b>Цена iHerb:</b>\n"
         f"<s>${old_usd:.2f}</s> "
-        f"➡️ <b>${current_usd:.2f}</b>\n\n"
+        f"➡️ <b>${current_usd:.2f}</b>\n"
+        "\n"
 
         f"🇰🇿 <b>Закуп:</b> "
-        f"≈ {cost_str} ₸\n\n"
+        f"≈ {cost_str} ₸\n"
+        "\n"
 
-        f"🏪 <b>Цена продажи:</b> "
-        f"{resell_str} ₸\n\n"
+        f"🏪 <b>Продажа:</b> "
+        f"{sale_str} ₸\n"
+        "\n"
 
         f"📈 <b>Прибыль:</b> "
-        f"+{profit_str} ₸\n\n"
+        f"+{profit_str} ₸\n"
+        "\n"
 
         f"💱 <b>Курс:</b> "
-        f"1 USD = {KZT_EXCHANGE_RATE} ₸\n\n"
+        f"1 USD = {KZT_EXCHANGE_RATE} ₸\n"
+        "\n"
 
         f"⏰ <b>Обнаружено:</b> "
-        f"{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+        f"{now}"
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -1688,13 +1725,16 @@ def format_deal_message(deal):
             [
                 InlineKeyboardButton(
                     text="🛒 Открыть товар на iHerb",
-                    url=link
+                    url=deal["link"],
                 )
             ]
         ]
     )
 
-    return message, keyboard
+    return (
+        message,
+        keyboard,
+    )
 
 
 # ============================================================
@@ -1705,14 +1745,12 @@ def get_targets():
 
     targets = set()
 
-    # CHAT_ID используется только если он задан
     if CHAT_ID:
 
         targets.add(
             CHAT_ID
         )
 
-    # Пользователи, которые нажали /start
     targets.update(
         subscribers
     )
@@ -1721,12 +1759,12 @@ def get_targets():
 
 
 # ============================================================
-# SEND MESSAGE
+# SEND
 # ============================================================
 
 async def send_deal(
     deal,
-    targets
+    targets,
 ):
 
     message, keyboard = (
@@ -1737,7 +1775,9 @@ async def send_deal(
 
     success = False
 
-    for target_id in list(targets):
+    for target_id in list(
+        targets
+    ):
 
         try:
 
@@ -1749,14 +1789,17 @@ async def send_deal(
                 disable_web_page_preview=True,
             )
 
-            logger.info(
-                f"✅ Отправлено {target_id}: "
+            logging.info(
+                "✅ Отправлено: "
+                f"{target_id} | "
                 f"{deal['title'][:70]}"
             )
 
             success = True
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(
+                1
+            )
 
         except TelegramRetryAfter as e:
 
@@ -1764,57 +1807,35 @@ async def send_deal(
                 getattr(
                     e,
                     "retry_after",
-                    30
+                    30,
                 )
             )
 
-            logger.warning(
-                f"⏳ Telegram Flood Control. "
-                f"Ждём {retry_after + 2} сек."
+            logging.warning(
+                f"⏳ Flood control: "
+                f"{retry_after} сек."
             )
 
             await asyncio.sleep(
                 retry_after + 2
             )
 
-            try:
-
-                await bot.send_message(
-                    chat_id=target_id,
-                    text=message,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
-                )
-
-                success = True
-
-            except Exception as retry_error:
-
-                logger.error(
-                    f"❌ Повторная отправка: "
-                    f"{retry_error}"
-                )
-
         except Exception as e:
 
             error_text = str(e)
 
-            logger.error(
+            logging.error(
                 f"❌ Telegram {target_id}: "
                 f"{error_text}"
             )
 
             # =================================================
-            # УДАЛЯЕМ НЕРАБОЧИЙ CHAT_ID
+            # ЕСЛИ CHAT NOT FOUND
+            # Больше не пытаемся слать туда
             # =================================================
 
             if (
                 "chat not found"
-                in error_text.lower()
-                or "bot was kicked"
-                in error_text.lower()
-                or "user is deactivated"
                 in error_text.lower()
             ):
 
@@ -1824,90 +1845,69 @@ async def send_deal(
                         target_id
                     )
 
-                    logger.warning(
-                        f"🗑 Удалён недоступный "
-                        f"subscriber: {target_id}"
-                    )
+                logging.warning(
+                    "🗑 Неверный Telegram CHAT_ID "
+                    f"удалён из subscribers: "
+                    f"{target_id}"
+                )
 
     return success
 
 
 # ============================================================
-# CHECK AND NOTIFY
+# CHECK
 # ============================================================
 
 async def check_and_notify(
-    force_send=False
+    force_send=False,
+    requester_chat_id=None,
 ):
 
-    global check_counter
-    global last_check_time
-    global last_deals_found
-    global last_deals_sent
+    start_time = datetime.now()
 
-    check_counter += 1
-
-    check_number = check_counter
-
-    started = datetime.now()
-
-    last_check_time = started
-
-    logger.info(
+    logging.info(
         ""
     )
 
-    logger.info(
-        "╔" + "═" * 58 + "╗"
+    logging.info(
+        "🚀 НОВЫЙ ЦИКЛ ПРОВЕРКИ"
     )
 
-    logger.info(
-        f"║ 🔄 ПРОВЕРКА #{check_number}"
+    logging.info(
+        f"🕐 Время: "
+        f"{start_time.strftime('%d.%m.%Y %H:%M:%S')}"
     )
 
-    logger.info(
-        f"║ ⏰ {started.strftime('%d.%m.%Y %H:%M:%S')}"
-    )
-
-    logger.info(
-        f"║ 🎯 Скидка от {MIN_DISCOUNT_PERCENT}%"
-    )
-
-    logger.info(
-        "╚" + "═" * 58 + "╝"
-    )
-
-    try:
-
-        deals = await fetch_iherb_specials()
-
-    except Exception as e:
-
-        logger.exception(
-            f"❌ Ошибка проверки: {e}"
-        )
-
-        last_deals_found = 0
-        last_deals_sent = 0
-
-        return
-
-    last_deals_found = len(
-        deals
-    )
-
-    last_deals_sent = 0
+    deals = await fetch_iherb_specials()
 
     if not deals:
 
-        logger.info(
-            f"ℹ️ Проверка #{check_number}: "
-            "подходящих товаров нет."
+        logging.info(
+            "ℹ️ Подходящих скидок сейчас нет"
         )
 
-        logger.info(
-            "💤 Бот продолжает работать."
-        )
+        if requester_chat_id:
+
+            try:
+
+                await bot.send_message(
+                    chat_id=requester_chat_id,
+                    text=(
+                        "🔎 <b>Проверка завершена</b>\n\n"
+                        "К сожалению, сейчас не найдено "
+                        f"товаров со скидкой "
+                        f"<b>{MIN_DISCOUNT_PERCENT}%+</b>.\n\n"
+                        "⏱ Автоматический мониторинг "
+                        "продолжается."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+
+            except Exception as e:
+
+                logging.error(
+                    f"Ошибка сообщения: {e}"
+                )
 
         return
 
@@ -1915,19 +1915,11 @@ async def check_and_notify(
 
     if not targets:
 
-        logger.warning(
-            "⚠️ НЕТ ПОЛУЧАТЕЛЕЙ TELEGRAM."
-        )
-
-        logger.warning(
-            "👉 Откройте бота и нажмите /start"
+        logging.warning(
+            "⚠️ Получателей нет"
         )
 
         return
-
-    logger.info(
-        f"👥 Получателей: {len(targets)}"
-    )
 
     sent_count = 0
 
@@ -1938,15 +1930,15 @@ async def check_and_notify(
         )
 
         # ====================================================
-        # AUTOMATIC MODE
+        # АВТОМАТИКА
         # ====================================================
 
         if not force_send:
 
             if deal_id in sent_deals_cache:
 
-                logger.info(
-                    f"⏭ Уже отправлялся: "
+                logging.info(
+                    "⏭ Уже отправлялся: "
                     f"{deal['title'][:70]}"
                 )
 
@@ -1954,7 +1946,7 @@ async def check_and_notify(
 
         success = await send_deal(
             deal,
-            targets
+            targets,
         )
 
         if success:
@@ -1971,26 +1963,43 @@ async def check_and_notify(
             sent_count
             >= MAX_DEALS_PER_CHECK
         ):
+
             break
 
-    last_deals_sent = sent_count
-
-    logger.info(
-        f"📤 Проверка #{check_number} завершена."
+    logging.info(
+        f"📤 Новых отправлено: "
+        f"{sent_count}"
     )
 
-    logger.info(
-        f"📦 Найдено: {len(deals)}"
-    )
+    # ========================================================
+    # ЕСЛИ РУЧНАЯ ПРОВЕРКА
+    # ========================================================
 
-    logger.info(
-        f"📨 Отправлено: {sent_count}"
-    )
+    if requester_chat_id:
 
-    logger.info(
-        "💤 Следующая проверка через "
-        f"{CHECK_INTERVAL_SECONDS // 60} минут."
-    )
+        try:
+
+            if force_send:
+
+                await bot.send_message(
+                    chat_id=requester_chat_id,
+                    text=(
+                        "✅ <b>Проверка завершена</b>\n\n"
+                        f"🔥 Найдено подходящих товаров: "
+                        f"<b>{len(deals)}</b>\n"
+                        f"📤 Отправлено: "
+                        f"<b>{sent_count}</b>\n\n"
+                        "🤖 Автомониторинг продолжает "
+                        "работать каждые 5 минут."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+
+        except Exception as e:
+
+            logging.error(
+                f"Ошибка итогового сообщения: {e}"
+            )
 
 
 # ============================================================
@@ -2000,7 +2009,9 @@ async def check_and_notify(
 @dp.message(
     Command("start")
 )
-async def start_handler(message):
+async def start_handler(
+    message
+):
 
     chat_id = str(
         message.chat.id
@@ -2010,31 +2021,23 @@ async def start_handler(message):
         chat_id
     )
 
-    logger.info(
-        f"👤 Новый subscriber: {chat_id}"
-    )
-
     await message.answer(
 
         "👋 <b>iHerb Deal Bot работает!</b>\n\n"
 
-        "🔥 Я автоматически ищу "
-        "товары со скидкой.\n\n"
+        "🔥 Я постоянно отслеживаю "
+        "скидки iHerb.\n\n"
 
         f"🎯 Минимальная скидка: "
         f"<b>{MIN_DISCOUNT_PERCENT}%</b>\n"
 
-        f"⏱ Проверка: "
-        f"<b>каждые 5 минут</b>\n\n"
+        "⏱ Автопроверка: "
+        "<b>каждые 5 минут</b>\n\n"
 
-        "📦 Поиск: "
-        "<b>все бренды</b>\n\n"
+        "Новые товары будут приходить "
+        "автоматически.\n\n"
 
-        "Теперь этот Telegram автоматически "
-        "зарегистрирован для получения скидок.\n\n"
-
-        "🔥 Нажмите «Получить скидки», "
-        "чтобы проверить iHerb прямо сейчас.",
+        "👇 Используйте кнопки ниже.",
 
         reply_markup=main_keyboard,
 
@@ -2052,7 +2055,12 @@ async def start_handler(message):
 @dp.message(
     F.text == "🔥 Получить скидки"
 )
-async def deals_handler(message):
+@dp.message(
+    F.text == "🔄 Проверить сейчас"
+)
+async def deals_handler(
+    message
+):
 
     chat_id = str(
         message.chat.id
@@ -2062,51 +2070,16 @@ async def deals_handler(message):
         chat_id
     )
 
-    logger.info(
-        f"🔥 Ручная проверка от {chat_id}"
-    )
-
     await message.answer(
         "🔎 <b>Проверяю iHerb...</b>\n\n"
-        "⏳ Пожалуйста, подождите несколько секунд.",
+        "⏳ Подождите несколько секунд.",
         parse_mode=ParseMode.HTML,
     )
 
-    before = last_deals_sent
-
     await check_and_notify(
-        force_send=True
+        force_send=True,
+        requester_chat_id=chat_id,
     )
-
-    if last_deals_found:
-
-        await message.answer(
-
-            f"✅ Проверка завершена.\n\n"
-            f"🔎 Найдено скидок: "
-            f"<b>{last_deals_found}</b>\n"
-            f"📨 Отправлено: "
-            f"<b>{last_deals_sent}</b>",
-
-            reply_markup=main_keyboard,
-
-            parse_mode=ParseMode.HTML,
-        )
-
-    else:
-
-        await message.answer(
-
-            "ℹ️ Сейчас подходящих скидок "
-            f"от {MIN_DISCOUNT_PERCENT}% "
-            "не найдено.\n\n"
-            "Автоматический мониторинг "
-            "продолжает работать.",
-
-            reply_markup=main_keyboard,
-
-            parse_mode=ParseMode.HTML,
-        )
 
 
 # ============================================================
@@ -2119,7 +2092,9 @@ async def deals_handler(message):
 @dp.message(
     F.text == "ℹ️ Статус"
 )
-async def status_handler(message):
+async def status_handler(
+    message
+):
 
     chat_id = str(
         message.chat.id
@@ -2132,82 +2107,43 @@ async def status_handler(message):
     brands_text = (
         "Все бренды"
         if not TARGET_BRANDS
-        else ", ".join(TARGET_BRANDS)
-    )
-
-    now = datetime.now()
-
-    if last_check_time:
-
-        seconds_ago = int(
-            (
-                now
-                - last_check_time
-            ).total_seconds()
+        else ", ".join(
+            TARGET_BRANDS
         )
-
-        if seconds_ago < 60:
-
-            last_check_text = (
-                f"{seconds_ago} сек. назад"
-            )
-
-        elif seconds_ago < 3600:
-
-            last_check_text = (
-                f"{seconds_ago // 60} мин. назад"
-            )
-
-        else:
-
-            last_check_text = (
-                f"{seconds_ago // 3600} ч. назад"
-            )
-
-    else:
-
-        last_check_text = "ещё не было"
+    )
 
     await message.answer(
 
-        f"📊 <b>СТАТУС iHERB БОТА</b>\n\n"
+        "📊 <b>СТАТУС iHERB BOT</b>\n\n"
 
-        f"🟢 Telegram: <b>ONLINE</b>\n"
+        "🟢 Telegram: ONLINE\n"
 
-        f"🟢 Мониторинг: <b>РАБОТАЕТ</b>\n\n"
+        "🟢 Мониторинг: ВКЛЮЧЁН\n"
 
-        f"🔄 Проверка каждые: "
-        f"<b>5 минут</b>\n"
+        "🟢 iHerb parser: ONLINE\n"
 
-        f"🔎 Проверок выполнено: "
-        f"<b>{check_counter}</b>\n"
-
-        f"⏰ Последняя проверка: "
-        f"<b>{last_check_text}</b>\n\n"
-
-        f"📦 Последняя найденная скидка: "
-        f"<b>{last_deals_found}</b>\n"
-
-        f"📨 Отправлено в последней проверке: "
-        f"<b>{last_deals_sent}</b>\n\n"
+        "🔄 Интервал: каждые 5 минут\n\n"
 
         f"🎯 Минимальная скидка: "
         f"<b>{MIN_DISCOUNT_PERCENT}%</b>\n"
 
         f"🏷 Бренды: "
-        f"<b>{brands_text}</b>\n\n"
+        f"{brands_text}\n\n"
 
         f"💱 Курс: "
-        f"<b>1 USD = {KZT_EXCHANGE_RATE} ₸</b>\n"
+        f"1 USD = {KZT_EXCHANGE_RATE} ₸\n"
 
         f"📈 Наценка: "
-        f"<b>+{MARGIN_MARKUP_PERCENT}%</b>\n\n"
+        f"+{MARGIN_MARKUP_PERCENT}%\n\n"
 
-        f"👥 Получателей: "
-        f"<b>{len(get_targets())}</b>\n"
+        f"💾 Уже отправлено: "
+        f"{len(sent_deals_cache)}\n\n"
 
-        f"💾 В памяти: "
-        f"<b>{len(sent_deals_cache)}</b> товаров",
+        f"👥 Подписчиков: "
+        f"{len(subscribers)}\n\n"
+
+        "🤖 Бот продолжает работать "
+        "автоматически.",
 
         reply_markup=main_keyboard,
 
@@ -2220,7 +2156,9 @@ async def status_handler(message):
 # ============================================================
 
 @dp.message()
-async def any_message_handler(message):
+async def any_message_handler(
+    message
+):
 
     chat_id = str(
         message.chat.id
@@ -2234,16 +2172,19 @@ async def any_message_handler(message):
 
         "👋 <b>iHerb Deal Bot</b>\n\n"
 
-        f"🎯 Минимальная скидка: "
+        f"🔥 Минимальная скидка: "
         f"<b>{MIN_DISCOUNT_PERCENT}%</b>\n\n"
 
-        "Используйте:\n\n"
+        "Используйте кнопки:\n\n"
 
-        "🔥 <b>Получить скидки</b> — "
-        "проверить iHerb сейчас\n\n"
+        "🔥 <b>Получить скидки</b>\n"
+        "— найти скидки прямо сейчас\n\n"
 
-        "ℹ️ <b>Статус</b> — "
-        "проверить работу бота.",
+        "🔄 <b>Проверить сейчас</b>\n"
+        "— ручной запуск проверки\n\n"
+
+        "ℹ️ <b>Статус</b>\n"
+        "— посмотреть состояние бота.",
 
         reply_markup=main_keyboard,
 
@@ -2252,60 +2193,35 @@ async def any_message_handler(message):
 
 
 # ============================================================
-# HEARTBEAT
-# ============================================================
-
-async def heartbeat():
-
-    """
-    Каждую минуту пишем в Render Logs,
-    чтобы было видно, что процесс жив.
-    """
-
-    while True:
-
-        try:
-
-            await asyncio.sleep(60)
-
-            logger.info(
-                "💚 HEARTBEAT | "
-                f"Бот работает | "
-                f"Проверок: {check_counter} | "
-                f"Получателей: {len(get_targets())} | "
-                f"Cache: {len(sent_deals_cache)} | "
-                f"Следующая проверка: "
-                f"{CHECK_INTERVAL_SECONDS // 60} мин."
-            )
-
-        except asyncio.CancelledError:
-
-            logger.info(
-                "🛑 Heartbeat остановлен."
-            )
-
-            break
-
-        except Exception as e:
-
-            logger.error(
-                f"❌ Heartbeat: {e}"
-            )
-
-
-# ============================================================
 # SCHEDULER
 # ============================================================
 
 async def scheduler():
 
-    logger.info(
-        "🚀 АВТОМАТИЧЕСКИЙ МОНИТОРИНГ ЗАПУЩЕН"
+    logging.info(
+        "=" * 60
     )
 
-    logger.info(
-        "⚡ Первая проверка выполняется СРАЗУ"
+    logging.info(
+        "🤖 АВТОМАТИЧЕСКИЙ МОНИТОРИНГ ЗАПУЩЕН"
     )
+
+    logging.info(
+        "⚡ Первая проверка запускается СРАЗУ"
+    )
+
+    logging.info(
+        f"⏱ Интервал: "
+        f"{CHECK_INTERVAL_SECONDS} секунд"
+    )
+
+    logging.info(
+        "=" * 60
+    )
+
+    # ========================================================
+    # ПЕРВАЯ ПРОВЕРКА
+    # ========================================================
 
     try:
 
@@ -2315,47 +2231,67 @@ async def scheduler():
 
     except Exception as e:
 
-        logger.exception(
-            f"❌ Первая проверка: {e}"
+        logging.exception(
+            f"❌ Ошибка первой проверки: {e}"
         )
+
+    # ========================================================
+    # БЕСКОНЕЧНЫЙ ЦИКЛ
+    # ========================================================
 
     while True:
 
         try:
 
-            logger.info(
+            logging.info(
+                ""
+            )
+
+            logging.info(
                 f"💤 Следующая проверка через "
-                f"{CHECK_INTERVAL_SECONDS // 60} минут..."
+                f"{CHECK_INTERVAL_SECONDS // 60} минут"
             )
 
             await asyncio.sleep(
                 CHECK_INTERVAL_SECONDS
             )
 
-            logger.info(
-                "⏰ Интервал завершён."
+            logging.info(
+                ""
             )
 
-            logger.info(
-                "🔄 ЗАПУСК НОВОЙ ПРОВЕРКИ iHERB"
+            logging.info(
+                "⏰ ИНТЕРВАЛ ЗАКОНЧИЛСЯ"
+            )
+
+            logging.info(
+                "🔄 ЗАПУСКАЕМ НОВУЮ ПРОВЕРКУ"
             )
 
             await check_and_notify(
                 force_send=False
             )
 
+            logging.info(
+                "✅ ЦИКЛ ПРОВЕРКИ ЗАВЕРШЁН"
+            )
+
         except asyncio.CancelledError:
 
-            logger.info(
-                "🛑 Scheduler остановлен."
+            logging.info(
+                "🛑 Scheduler остановлен"
             )
 
             break
 
         except Exception as e:
 
-            logger.exception(
-                f"❌ Scheduler error: {e}"
+            logging.exception(
+                f"❌ Ошибка scheduler: {e}"
+            )
+
+            logging.info(
+                "🔄 Повтор через 30 секунд"
             )
 
             await asyncio.sleep(
@@ -2376,35 +2312,61 @@ async def start_dummy_server():
         port = int(
             os.environ.get(
                 "PORT",
-                "10000"
+                "10000",
             )
         )
 
         app = web.Application()
 
-        async def home(request):
+        async def home(
+            request
+        ):
 
             return web.Response(
                 text=(
-                    "iHerb Telegram Bot "
-                    "is running!"
+                    "iHerb Deal Bot is running!"
                 )
             )
 
-        async def health(request):
+        async def health(
+            request
+        ):
 
             return web.Response(
                 text="OK"
             )
 
+        async def status(
+            request
+        ):
+
+            return web.json_response(
+                {
+                    "status": "online",
+                    "bot": "iHerb Deal Bot",
+                    "interval": CHECK_INTERVAL_SECONDS,
+                    "min_discount": MIN_DISCOUNT_PERCENT,
+                    "subscribers": len(subscribers),
+                    "cache": len(
+                        sent_deals_cache
+                    ),
+                    "time": datetime.now().isoformat(),
+                }
+            )
+
         app.router.add_get(
             "/",
-            home
+            home,
         )
 
         app.router.add_get(
             "/health",
-            health
+            health,
+        )
+
+        app.router.add_get(
+            "/status",
+            status,
         )
 
         runner = web.AppRunner(
@@ -2416,19 +2378,19 @@ async def start_dummy_server():
         site = web.TCPSite(
             runner,
             "0.0.0.0",
-            port
+            port,
         )
 
         await site.start()
 
-        logger.info(
-            f"🌐 Render Health Server "
-            f"запущен на порту {port}"
+        logging.info(
+            f"🌐 Render Health Server: "
+            f"0.0.0.0:{port}"
         )
 
     except Exception as e:
 
-        logger.exception(
+        logging.exception(
             f"❌ Health Server: {e}"
         )
 
@@ -2439,42 +2401,46 @@ async def start_dummy_server():
 
 async def main():
 
-    logger.info(
-        "=" * 60
+    logging.info(
+        ""
     )
 
-    logger.info(
-        "🚀 ЗАПУСК iHERB TELEGRAM BOT"
+    logging.info(
+        "=" * 70
     )
 
-    logger.info(
-        "=" * 60
+    logging.info(
+        "🚀 ЗАПУСК iHERB TELEGRAM DEAL BOT"
     )
 
-    logger.info(
+    logging.info(
+        "=" * 70
+    )
+
+    logging.info(
         f"🎯 Минимальная скидка: "
         f"{MIN_DISCOUNT_PERCENT}%"
     )
 
-    logger.info(
+    logging.info(
         f"💱 USD/KZT: "
         f"{KZT_EXCHANGE_RATE}"
     )
 
-    logger.info(
+    logging.info(
         f"📈 Наценка: "
         f"{MARGIN_MARKUP_PERCENT}%"
     )
 
-    logger.info(
-        f"🔄 Интервал: "
+    logging.info(
+        f"⏱ Проверка каждые: "
         f"{CHECK_INTERVAL_SECONDS // 60} минут"
     )
 
     if TARGET_BRANDS:
 
-        logger.info(
-            "🏷 Фильтр брендов: "
+        logging.info(
+            "🏷 Бренды: "
             + ", ".join(
                 TARGET_BRANDS
             )
@@ -2482,7 +2448,7 @@ async def main():
 
     else:
 
-        logger.info(
+        logging.info(
             "🏷 Бренды: ВСЕ"
         )
 
@@ -2499,15 +2465,11 @@ async def main():
     await start_dummy_server()
 
     # ========================================================
-    # BACKGROUND TASKS
+    # SCHEDULER
     # ========================================================
 
     scheduler_task = asyncio.create_task(
         scheduler()
-    )
-
-    heartbeat_task = asyncio.create_task(
-        heartbeat()
     )
 
     # ========================================================
@@ -2526,12 +2488,12 @@ async def main():
 
             except Exception as e:
 
-                logger.warning(
+                logging.warning(
                     f"Webhook: {e}"
                 )
 
-            logger.info(
-                "🤖 Telegram polling запущен."
+            logging.info(
+                "🤖 Telegram polling запущен"
             )
 
             await dp.start_polling(
@@ -2544,7 +2506,7 @@ async def main():
 
             error_text = str(e)
 
-            logger.error(
+            logging.error(
                 f"❌ Telegram polling: "
                 f"{error_text}"
             )
@@ -2558,19 +2520,21 @@ async def main():
                 in error_text
             ):
 
-                logger.warning(
-                    "⚠️ Telegram Conflict. "
-                    "Ждём 10 секунд..."
+                logging.warning(
+                    "⚠️ Telegram Conflict"
                 )
 
                 await asyncio.sleep(
                     10
                 )
 
-            elif "Unauthorized" in error_text:
+            elif (
+                "Unauthorized"
+                in error_text
+            ):
 
-                logger.error(
-                    "❌ TELEGRAM UNAUTHORIZED!"
+                logging.error(
+                    "❌ Неверный BOT_TOKEN"
                 )
 
                 await asyncio.sleep(
@@ -2579,9 +2543,9 @@ async def main():
 
             else:
 
-                logger.warning(
+                logging.warning(
                     "🔄 Перезапуск Telegram "
-                    "через 5 секунд..."
+                    "через 5 секунд"
                 )
 
                 await asyncio.sleep(
@@ -2593,16 +2557,13 @@ async def main():
     # ========================================================
 
     scheduler_task.cancel()
-    heartbeat_task.cancel()
 
     try:
+
         await scheduler_task
-    except asyncio.CancelledError:
-        pass
 
-    try:
-        await heartbeat_task
     except asyncio.CancelledError:
+
         pass
 
     await bot.session.close()
@@ -2622,6 +2583,6 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        logger.info(
-            "🛑 Бот остановлен."
+        logging.info(
+            "🛑 Бот остановлен"
         )
