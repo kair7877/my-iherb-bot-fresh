@@ -1,3241 +1,439 @@
-import asyncio
-import json
-import logging
-import os
-import re
-import tempfile
+import asyncio, json, logging, os, re, tempfile
 from datetime import datetime, timezone, timedelta
-from html import escape
 from urllib.parse import urljoin
+from html import escape
 
 import httpx
 from bs4 import BeautifulSoup
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramRetryAfter
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("iherb")
 
-# ============================================================
-# iHERB DEAL BOT
-# STABLE RENDER VERSION
-# ============================================================
+# ========================= SETTINGS =========================
+def env(name, default=""):
+    v = os.getenv(name, default)
+    if v is None or str(v).strip().upper() == name.upper(): return default
+    return str(v).strip()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+def intval(name, default):
+    try: return int(float(env(name, default)))
+    except: return default
 
-logger = logging.getLogger("iherb_bot")
+def numval(name, default):
+    try: return float(env(name, default).replace(",", "."))
+    except: return default
 
-
-# ============================================================
-# ENV
-# ============================================================
-
-def env_str(name, default=""):
-    value = os.getenv(name, default)
-
-    if value is None:
-        return default
-
-    value = str(value).strip()
-
-    if value.upper() == name.upper():
-        return default
-
-    return value
-
-
-def env_int(name, default):
-    value = env_str(name, "")
-
-    if not value:
-        return default
-
-    try:
-        return int(float(value))
-    except Exception:
-        logger.warning(
-            "⚠️ %s=%s некорректно. Использую %s",
-            name,
-            value,
-            default,
-        )
-        return default
-
-
-def env_float(name, default):
-    value = env_str(name, "")
-
-    if not value:
-        return default
-
-    try:
-        return float(value.replace(",", "."))
-    except Exception:
-        logger.warning(
-            "⚠️ %s=%s некорректно. Использую %s",
-            name,
-            value,
-            default,
-        )
-        return default
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-BOT_TOKEN = env_str("BOT_TOKEN", "")
-CHAT_ID = env_str("CHAT_ID", "")
-
-KZT_EXCHANGE_RATE = env_float(
-    "KZT_EXCHANGE_RATE",
-    540,
-)
-
-MARGIN_MARKUP_PERCENT = env_float(
-    "MARGIN_MARKUP_PERCENT",
-    35,
-)
-
-MIN_DISCOUNT_PERCENT = env_int(
-    "MIN_DISCOUNT_PERCENT",
-    20,
-)
-
-MAX_DISCOUNT_PERCENT = env_int(
-    "MAX_DISCOUNT_PERCENT",
-    90,
-)
-
-MAX_DEALS_PER_CHECK = env_int(
-    "MAX_DEALS_PER_CHECK",
-    10,
-)
-
-CHECK_INTERVAL_SECONDS = max(
-    60,
-    env_int(
-        "CHECK_INTERVAL_SECONDS",
-        300,
-    ),
-)
-
-HEARTBEAT_SECONDS = max(
-    30,
-    env_int(
-        "HEARTBEAT_SECONDS",
-        60,
-    ),
-)
-
-DATABASE_URL = env_str(
-    "DATABASE_URL",
-    "",
-)
-
-
-# ============================================================
-# BRANDS
-#
-# [] = ВСЕ БРЕНДЫ
-# ============================================================
-
+BOT_TOKEN = env("BOT_TOKEN")
+CHAT_ID = env("CHAT_ID")
+KZT = numval("KZT_EXCHANGE_RATE", 540)
+MARKUP = numval("MARGIN_MARKUP_PERCENT", 35)
+MIN_DISCOUNT = intval("MIN_DISCOUNT_PERCENT", 20)
+MAX_DISCOUNT = intval("MAX_DISCOUNT_PERCENT", 90)
+MAX_SEND = max(1, intval("MAX_DEALS_PER_CHECK", 10))
+INTERVAL = max(60, intval("CHECK_INTERVAL_SECONDS", 300))
+HEARTBEAT = max(30, intval("HEARTBEAT_SECONDS", 60))
+MIN_PROFIT_KZT = max(0, intval("MIN_PROFIT_KZT", 1000))
+MIN_PRICE_USD = max(0, numval("MIN_PRICE_USD", 3))
+DATABASE_URL = env("DATABASE_URL")
 TARGET_BRANDS = []
+EXCLUDE_KEYWORDS = [x.strip().lower() for x in env(
+    "EXCLUDE_KEYWORDS", "ebook,book,audiobook,gift card,giftcard,free sample,sample only"
+).split(",") if x.strip()]
 
-
-# ============================================================
-# BOT
-# ============================================================
-
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "❌ BOT_TOKEN не найден в Render Environment Variables."
-    )
-
-
-bot = Bot(
-    token=BOT_TOKEN
-)
-
-dp = Dispatcher()
-
-
-# ============================================================
-# OPTIONAL POSTGRES
-# ============================================================
+if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN не найден в Render Environment Variables")
 
 try:
     import asyncpg
-
-    HAS_POSTGRES = True
-
 except ImportError:
     asyncpg = None
-    HAS_POSTGRES = False
-
-    logger.warning(
-        "⚠️ asyncpg не установлен."
-    )
-
-
-# ============================================================
-# CURL CFFI
-# ============================================================
 
 try:
     from curl_cffi import requests as curl_requests
-
-    HAS_CURL_CFFI = True
-
-    logger.info(
-        "✅ curl_cffi доступен."
-    )
-
+    CURL = True
 except ImportError:
-    curl_requests = None
-    HAS_CURL_CFFI = False
+    curl_requests = None; CURL = False
 
-    logger.warning(
-        "⚠️ curl_cffi отсутствует. Используем httpx."
-    )
+# ========================= STORAGE =========================
+# ВАЖНО: /var/data больше нигде не используется.
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "iherb_bot")
+CACHE_FILE = os.path.join(CACHE_DIR, "sent_deals.json")
+MAX_CACHE = 5000
+sent_cache = set()
+db_pool = None
+storage_mode = "temporary /tmp"
 
+async def storage_init():
+    global db_pool, storage_mode, sent_cache
 
-# ============================================================
-# CACHE
-#
-# НИКОГДА НЕ ИСПОЛЬЗУЕМ /var/data
-# Render Free может запретить запись туда.
-#
-# /tmp разрешён.
-# ============================================================
-
-CACHE_DIR = os.path.join(
-    tempfile.gettempdir(),
-    "iherb_bot",
-)
-
-CACHE_FILE = os.path.join(
-    CACHE_DIR,
-    "sent_deals.json",
-)
-
-MAX_CACHE_ITEMS = 5000
-
-sent_deals_cache = set()
-
-
-# ============================================================
-# RUNTIME
-# ============================================================
-
-subscribers = set()
-
-validated_chat_id = None
-
-last_check_started = None
-last_check_finished = None
-
-last_check_ok = False
-last_check_found = 0
-last_check_sent = 0
-
-next_check_at = None
-
-check_in_progress = False
-
-monitor_started_at = (
-    datetime.now(timezone.utc)
-)
-
-
-# ============================================================
-# KEYBOARD
-# ============================================================
-
-main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [
-            KeyboardButton(
-                text="🔥 Получить скидки"
-            ),
-            KeyboardButton(
-                text="ℹ️ Статус"
-            ),
-        ]
-    ],
-    resize_keyboard=True,
-)
-
-
-# ============================================================
-# HEADERS
-# ============================================================
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/124.0.0.0 "
-        "Safari/537.36"
-    ),
-    "Accept-Language": (
-        "en-US,en;q=0.9,ru;q=0.8"
-    ),
-    "Accept": (
-        "text/html,"
-        "application/xhtml+xml,"
-        "application/xml;q=0.9,"
-        "image/avif,"
-        "image/webp,"
-        "*/*;q=0.8"
-    ),
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
-
-
-# ============================================================
-# STORAGE
-# ============================================================
-
-async def init_storage():
-
-    global sent_deals_cache
-
-    # --------------------------------------------------------
-    # POSTGRES
-    # --------------------------------------------------------
-
-    if DATABASE_URL and HAS_POSTGRES:
-
+    if DATABASE_URL and asyncpg:
         try:
-
-            conn = await asyncpg.connect(
-                DATABASE_URL
+            db_pool = await asyncpg.create_pool(
+                DATABASE_URL, min_size=1, max_size=3, command_timeout=15
             )
-
-            try:
-
-                await conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS sent_deals (
-                        product_id TEXT PRIMARY KEY,
-                        title TEXT NOT NULL,
-                        discount INTEGER,
-                        price_usd DOUBLE PRECISION,
-                        link TEXT,
-                        sent_at TIMESTAMPTZ
-                            NOT NULL DEFAULT NOW()
-                    )
-                    """
-                )
-
-            finally:
-
-                await conn.close()
-
-            logger.info(
-                "💾 PostgreSQL подключён."
-            )
-
+            async with db_pool.acquire() as conn:
+                await conn.execute("""CREATE TABLE IF NOT EXISTS sent_deals(
+                    product_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    discount INTEGER,
+                    price_usd DOUBLE PRECISION,
+                    link TEXT,
+                    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+            storage_mode = "PostgreSQL"
+            log.info("💾 PostgreSQL подключён — постоянная память включена")
             return
-
         except Exception as e:
+            log.warning("⚠️ PostgreSQL недоступен: %s", e)
+            db_pool = None
 
-            logger.exception(
-                "❌ PostgreSQL недоступен: %s",
-                e,
-            )
-
-            logger.warning(
-                "⚠️ Перехожу на временный cache /tmp."
-            )
-
-    # --------------------------------------------------------
-    # TEMP CACHE
-    # --------------------------------------------------------
-
+    os.makedirs(CACHE_DIR, exist_ok=True)
     try:
-
-        os.makedirs(
-            CACHE_DIR,
-            exist_ok=True,
-        )
-
-        load_cache()
-
-        logger.info(
-            "💾 Cache: %s",
-            CACHE_FILE,
-        )
-
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            sent_cache = {str(x) for x in data} if isinstance(data, list) else set()
+        log.warning("⚠️ Используется временный /tmp cache: %s товаров", len(sent_cache))
     except Exception as e:
-
-        logger.warning(
-            "⚠️ Cache init ошибка: %s",
-            e,
-        )
-
-        sent_deals_cache = set()
-
-
-def load_cache():
-
-    global sent_deals_cache
-
-    try:
-
-        if not os.path.exists(
-            CACHE_FILE
-        ):
-
-            sent_deals_cache = set()
-
-            logger.info(
-                "💾 Cache пока пуст."
-            )
-
-            return
-
-        with open(
-            CACHE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
-            data = json.load(
-                file
-            )
-
-        if isinstance(
-            data,
-            list,
-        ):
-
-            sent_deals_cache = {
-                str(x)
-                for x in data
-            }
-
-        else:
-
-            sent_deals_cache = set()
-
-        logger.info(
-            "💾 Cache загружен: %s товаров.",
-            len(sent_deals_cache),
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "⚠️ Ошибка загрузки cache: %s",
-            e,
-        )
-
-        sent_deals_cache = set()
-
+        log.warning("⚠️ Cache load: %s", e)
 
 def save_cache():
-
     try:
-
-        # ----------------------------------------------------
-        # ГАРАНТИРОВАННО /tmp
-        # ----------------------------------------------------
-
-        os.makedirs(
-            CACHE_DIR,
-            exist_ok=True,
-        )
-
-        data = list(
-            sent_deals_cache
-        )[-MAX_CACHE_ITEMS:]
-
-        temp_file = (
-            CACHE_FILE
-            + ".tmp"
-        )
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8",
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-        os.replace(
-            temp_file,
-            CACHE_FILE,
-        )
-
-        logger.debug(
-            "💾 Cache сохранён: %s",
-            CACHE_FILE,
-        )
-
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(sent_cache)[-MAX_CACHE:], f, ensure_ascii=False)
+        os.replace(tmp, CACHE_FILE)
     except Exception as e:
+        log.warning("⚠️ Cache не сохранён: %s", e)
 
-        logger.warning(
-            "⚠️ Cache не сохранён: %s",
-            e,
-        )
-
-
-async def is_sent(product_id):
-
-    product_id = str(
-        product_id
-    )
-
-    # --------------------------------------------------------
-    # POSTGRES
-    # --------------------------------------------------------
-
-    if DATABASE_URL and HAS_POSTGRES:
-
+async def is_sent(pid):
+    pid = str(pid)
+    if db_pool:
         try:
-
-            conn = await asyncpg.connect(
-                DATABASE_URL
-            )
-
-            try:
-
-                result = await conn.fetchval(
-                    """
-                    SELECT 1
-                    FROM sent_deals
-                    WHERE product_id=$1
-                    LIMIT 1
-                    """,
-                    product_id,
-                )
-
-                return result is not None
-
-            finally:
-
-                await conn.close()
-
+            async with db_pool.acquire() as conn:
+                return await conn.fetchval(
+                    "SELECT 1 FROM sent_deals WHERE product_id=$1", pid
+                ) is not None
         except Exception as e:
+            log.warning("DB is_sent: %s", e)
+    return pid in sent_cache
 
-            logger.warning(
-                "⚠️ DB is_sent: %s",
-                e,
-            )
+async def mark_sent(d):
+    global sent_cache
+    pid = str(d["id"])
+    sent_cache.add(pid)
+    if len(sent_cache) > MAX_CACHE:
+        sent_cache = set(list(sent_cache)[-MAX_CACHE:])
 
-    # --------------------------------------------------------
-    # TEMP CACHE
-    # --------------------------------------------------------
-
-    return (
-        product_id
-        in sent_deals_cache
-    )
-
-
-async def mark_sent(deal):
-
-    global sent_deals_cache
-
-    product_id = str(
-        deal["id"]
-    )
-
-    # --------------------------------------------------------
-    # СНАЧАЛА добавляем в память
-    # --------------------------------------------------------
-
-    sent_deals_cache.add(
-        product_id
-    )
-
-    if len(
-        sent_deals_cache
-    ) > MAX_CACHE_ITEMS:
-
-        sent_deals_cache = set(
-            list(
-                sent_deals_cache
-            )[-MAX_CACHE_ITEMS:]
-        )
-
-    # --------------------------------------------------------
-    # POSTGRES
-    # --------------------------------------------------------
-
-    if DATABASE_URL and HAS_POSTGRES:
-
+    if db_pool:
         try:
-
-            conn = await asyncpg.connect(
-                DATABASE_URL
-            )
-
-            try:
-
-                await conn.execute(
-                    """
-                    INSERT INTO sent_deals
-                    (
-                        product_id,
-                        title,
-                        discount,
-                        price_usd,
-                        link
-                    )
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5
-                    )
-                    ON CONFLICT(product_id)
-                    DO NOTHING
-                    """,
-                    product_id,
-                    deal["title"],
-                    deal["discount_percent"],
-                    deal["discount_price_usd"],
-                    deal["link"],
-                )
-
-            finally:
-
-                await conn.close()
-
-            logger.debug(
-                "💾 DB сохранён: %s",
-                product_id,
-            )
-
+            async with db_pool.acquire() as conn:
+                await conn.execute("""INSERT INTO sent_deals
+                    (product_id,title,discount,price_usd,link)
+                    VALUES($1,$2,$3,$4,$5)
+                    ON CONFLICT(product_id) DO NOTHING""",
+                    pid, d["title"], d["discount_percent"],
+                    d["discount_price_usd"], d["link"])
             return
-
         except Exception as e:
-
-            logger.warning(
-                "⚠️ DB mark_sent: %s",
-                e,
-            )
-
-    # --------------------------------------------------------
-    # TEMP CACHE
-    # --------------------------------------------------------
-
+            log.warning("DB mark_sent: %s", e)
     save_cache()
 
-
-async def cache_count():
-
-    if DATABASE_URL and HAS_POSTGRES:
-
+async def stored_count():
+    if db_pool:
         try:
+            async with db_pool.acquire() as conn:
+                return int(await conn.fetchval(
+                    "SELECT COUNT(*) FROM sent_deals") or 0)
+        except Exception:
+            pass
+    return len(sent_cache)
 
-            conn = await asyncpg.connect(
-                DATABASE_URL
-            )
+# ========================= BOT =========================
+bot=Bot(BOT_TOKEN); dp=Dispatcher(); subscribers=set(); validated_chat=None
+last_finished=None; last_found=0; last_sent=0; next_check=None; checking=False
+keyboard=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔥 Получить скидки"),KeyboardButton(text="ℹ️ Статус")]],resize_keyboard=True)
+HEADERS={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36","Accept-Language":"en-US,en;q=0.9,ru;q=0.8","Cache-Control":"no-cache"}
 
-            try:
+# ========================= PARSING =========================
+def clean(x): return re.sub(r"\s+"," ",str(x or "")).strip()
 
-                value = await conn.fetchval(
-                    """
-                    SELECT COUNT(*)
-                    FROM sent_deals
-                    """
-                )
-
-                return int(
-                    value or 0
-                )
-
-            finally:
-
-                await conn.close()
-
-        except Exception as e:
-
-            logger.warning(
-                "⚠️ DB count: %s",
-                e,
-            )
-
-    return len(
-        sent_deals_cache
-    )
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def clean_text(text):
-
-    if not text:
-        return ""
-
-    return re.sub(
-        r"\s+",
-        " ",
-        str(text),
-    ).strip()
-
-
-def safe_float(value):
-
-    if value is None:
-        return None
-
+def price_num(x):
     try:
+        x=str(x).replace("\xa0","").replace(" ","")
+        x=x.replace(",",".") if "," in x and "." not in x else x.replace(",","")
+        x=re.sub(r"[^0-9.]","",x); n=float(x)
+        return n if 0<n<1000000 else None
+    except: return None
 
-        text = str(
-            value
-        )
-
-        text = (
-            text
-            .replace("\xa0", "")
-            .replace(" ", "")
-        )
-
-        if (
-            "," in text
-            and "." not in text
-        ):
-
-            text = text.replace(
-                ",",
-                ".",
-            )
-
-        else:
-
-            text = text.replace(
-                ",",
-                "",
-            )
-
-        text = re.sub(
-            r"[^\d.]",
-            "",
-            text,
-        )
-
-        if not text:
-            return None
-
-        number = float(
-            text
-        )
-
-        if number <= 0:
-            return None
-
-        if number >= 1000000:
-            return None
-
-        return number
-
-    except Exception:
-
-        return None
-
-
-# ============================================================
-# PRICE PARSER
-# ============================================================
-
-def extract_currency_prices(text):
-
-    if not text:
-        return []
-
-    text = str(
-        text
-    ).replace(
-        "\xa0",
-        " ",
-    )
-
-    patterns = [
-
-        (
-            "USD",
-            r"US\$\s*"
-            r"([\d\s]+(?:[.,]\d{1,2})?)",
-        ),
-
-        (
-            "USD",
-            r"\$\s*"
-            r"([\d\s]+(?:[.,]\d{1,2})?)",
-        ),
-
-        (
-            "USD",
-            r"USD\s*"
-            r"([\d\s]+(?:[.,]\d{1,2})?)",
-        ),
-
-        (
-            "USD",
-            r"([\d\s]+(?:[.,]\d{1,2})?)"
-            r"\s*(?:USD|US\$|\$)",
-        ),
-
-        (
-            "KZT",
-            r"₸\s*"
-            r"([\d\s]+(?:[.,]\d{1,2})?)",
-        ),
-
-        (
-            "KZT",
-            r"([\d\s]+(?:[.,]\d{1,2})?)"
-            r"\s*₸",
-        ),
-
-        (
-            "KZT",
-            r"KZT\s*"
-            r"([\d\s]+(?:[.,]\d{1,2})?)",
-        ),
-
-        (
-            "KZT",
-            r"([\d\s]+(?:[.,]\d{1,2})?)"
-            r"\s*KZT",
-        ),
-    ]
-
-    result = []
-
-    for currency, pattern in patterns:
-
+def prices(text):
+    if not text:return []
+    p=[("USD",r"US\$\s*([\d\s]+(?:[.,]\d{1,2})?)"),("USD",r"\$\s*([\d\s]+(?:[.,]\d{1,2})?)"),("USD",r"USD\s*([\d\s]+(?:[.,]\d{1,2})?)"),("KZT",r"₸\s*([\d\s]+(?:[.,]\d{1,2})?)"),("KZT",r"([\d\s]+(?:[.,]\d{1,2})?)\s*₸")]
+    out=[]
+    for cur,pat in p:
         try:
+            for x in re.findall(pat,str(text),re.I):
+                n=price_num(x)
+                if n: out.append((cur,n))
+        except: pass
+    return out
 
-            matches = re.findall(
-                pattern,
-                text,
-                re.IGNORECASE,
-            )
-
-            for value in matches:
-
-                number = safe_float(
-                    value
-                )
-
-                if number is None:
-                    continue
-
-                result.append(
-                    (
-                        currency,
-                        number,
-                    )
-                )
-
-        except Exception:
-            pass
-
-    return result
-
-
-# ============================================================
-# DISCOUNT
-# ============================================================
-
-def extract_discount_percent(text):
-
-    if not text:
-        return None
-
-    text = clean_text(
-        text
-    )
-
-    patterns = [
-
-        r"(\d{1,2})\s*%\s*off",
-
-        r"(\d{1,2})\s*%\s*discount",
-
-        r"-\s*(\d{1,2})\s*%",
-
-        r"(\d{1,2})\s*%\s*скид",
-
-        r"скидк[аи]?\s*(?:до\s*)?"
-        r"(\d{1,2})\s*%",
-
-        r"save\s+(\d{1,2})\s*%",
-
-        r"(\d{1,2})\s*%\s*save",
-    ]
-
-    for pattern in patterns:
-
-        try:
-
-            match = re.search(
-                pattern,
-                text,
-                re.IGNORECASE,
-            )
-
-            if not match:
-                continue
-
-            value = int(
-                match.group(1)
-            )
-
-            if (
-                MIN_DISCOUNT_PERCENT
-                <= value
-                <= MAX_DISCOUNT_PERCENT
-            ):
-
-                return value
-
-        except Exception:
-            pass
-
+def discount(text):
+    for pat in [r"(\d{1,2})\s*%\s*off",r"(\d{1,2})\s*%\s*discount",r"-\s*(\d{1,2})\s*%",r"(\d{1,2})\s*%\s*скид",r"скидк\w*\s*(?:до\s*)?(\d{1,2})\s*%",r"save\s+(\d{1,2})\s*%"]:
+        m=re.search(pat,clean(text),re.I)
+        if m:
+            n=int(m.group(1))
+            if MIN_DISCOUNT<=n<=MAX_DISCOUNT:return n
     return None
 
+def normurl(u):
+    u=str(u or "").strip()
+    if u.startswith("//"): return "https:"+u
+    if u.startswith("/"): return "https://www.iherb.com"+u
+    if u.startswith("http://"): return "https://"+u[7:]
+    if u.startswith("https://"): return u
+    return urljoin("https://www.iherb.com/",u)
 
-# ============================================================
-# URL
-# ============================================================
+def pid(url):
+    m=re.search(r"/(\d+)(?:\?|$)",url or "")
+    return m.group(1) if m else url
 
-def normalize_url(url):
-
-    if not url:
-        return ""
-
-    url = str(
-        url
-    ).strip()
-
-    if url.startswith("//"):
-        return "https:" + url
-
-    if url.startswith("/"):
-        return (
-            "https://www.iherb.com"
-            + url
-        )
-
-    if url.startswith(
-        "http://"
-    ):
-
-        return (
-            "https://"
-            + url[7:]
-        )
-
-    if url.startswith(
-        "https://"
-    ):
-
-        return url
-
-    return urljoin(
-        "https://www.iherb.com/",
-        url,
-    )
-
-
-def extract_product_id(link):
-
-    if not link:
-        return ""
-
-    patterns = [
-
-        r"/(\d+)$",
-
-        r"/(\d+)\?",
-
-        r"/pr/[^/]+/(\d+)",
-
-        r"/pr/[^/]+/(\d+)/",
-    ]
-
-    for pattern in patterns:
-
+def title(card):
+    for s in [".product-title","[class*='product-title']","[class*='ProductTitle']","[class*='title']"]:
         try:
-
-            match = re.search(
-                pattern,
-                link,
-            )
-
-            if match:
-                return match.group(1)
-
-        except Exception:
-            pass
-
-    return link
-
-
-# ============================================================
-# BRAND
-# ============================================================
-
-def find_brand(title):
-
-    if not title:
-        return ""
-
-    if not TARGET_BRANDS:
-        return "iHerb"
-
-    title_lower = title.lower()
-
-    for brand in TARGET_BRANDS:
-
-        if (
-            brand.lower()
-            in title_lower
-        ):
-
-            return brand
-
+            e=card.select_one(s); t=clean(e.get_text(" ",strip=True)) if e else ""
+            if len(t)>=3:return t
+        except: pass
+    for e in card.select("a[href]"):
+        t=clean(e.get_text(" ",strip=True))
+        if len(t)>=10:return t
     return ""
 
-
-# ============================================================
-# DISCOUNT CALCULATIONS
-# ============================================================
-
-def calculate_discount(
-    old_price,
-    current_price,
-):
-
-    if not old_price:
-        return None
-
-    if not current_price:
-        return None
-
-    if old_price <= current_price:
-        return None
-
-    percent = round(
-        (
-            1
-            - current_price
-            / old_price
-        )
-        * 100
-    )
-
-    return percent
-
-
-def infer_old_price(
-    current_price,
-    discount_percent,
-):
-
-    if not current_price:
-        return None
-
-    if not discount_percent:
-        return None
-
-    if discount_percent >= 100:
-        return None
-
-    return round(
-        current_price
-        / (
-            1
-            - discount_percent / 100
-        ),
-        2,
-    )
-
-
-def choose_prices(
-    currency_prices,
-    discount_percent,
-):
-
-    if not currency_prices:
-
-        return (
-            None,
-            None,
-            None,
-        )
-
-    by_currency = {
-        "USD": [],
-        "KZT": [],
-    }
-
-    for currency, value in currency_prices:
-
-        if currency not in by_currency:
-            continue
-
-        value = round(
-            value,
-            2,
-        )
-
-        if value not in by_currency[
-            currency
-        ]:
-
-            by_currency[
-                currency
-            ].append(
-                value
-            )
-
-    # --------------------------------------------------------
-    # USD
-    # --------------------------------------------------------
-
-    if by_currency["USD"]:
-
-        values = sorted(
-            by_currency["USD"]
-        )
-
-        current = values[0]
-
-        old = (
-            values[-1]
-            if len(values) >= 2
-            else None
-        )
-
-        if (
-            old is not None
-            and old <= current
-        ):
-
-            old = None
-
-        if (
-            old is None
-            and discount_percent
-        ):
-
-            old = infer_old_price(
-                current,
-                discount_percent,
-            )
-
-        return (
-            current,
-            old,
-            "USD",
-        )
-
-    # --------------------------------------------------------
-    # KZT
-    # --------------------------------------------------------
-
-    if by_currency["KZT"]:
-
-        values = sorted(
-            by_currency["KZT"]
-        )
-
-        current_kzt = values[0]
-
-        old_kzt = (
-            values[-1]
-            if len(values) >= 2
-            else None
-        )
-
-        if (
-            old_kzt is not None
-            and old_kzt <= current_kzt
-        ):
-
-            old_kzt = None
-
-        if (
-            old_kzt is None
-            and discount_percent
-        ):
-
-            old_kzt = infer_old_price(
-                current_kzt,
-                discount_percent,
-            )
-
-        current_usd = (
-            current_kzt
-            / KZT_EXCHANGE_RATE
-        )
-
-        old_usd = (
-            old_kzt
-            / KZT_EXCHANGE_RATE
-            if old_kzt
-            else None
-        )
-
-        return (
-            current_usd,
-            old_usd,
-            "KZT",
-        )
-
-    return (
-        None,
-        None,
-        None,
-    )
-
-
-# ============================================================
-# CARD PRICE TEXT
-# ============================================================
-
-def get_card_price_texts(card):
-
-    selectors = [
-
-        ".price",
-
-        ".price-discount",
-
-        ".price-original",
-
-        ".price-old",
-
-        ".original-price",
-
-        ".discount-price",
-
-        ".product-price",
-
-        "[class*='price']",
-
-        "[class*='Price']",
-
-        "[data-qa*='price']",
-
-        "[data-testid*='price']",
-    ]
-
-    texts = []
-
-    for selector in selectors:
-
+def link(card):
+    for s in ["a[href*='/pr/']","a[href*='/product/']","a[href]"]:
         try:
+            e=card.select_one(s)
+            if e:
+                u=normurl(e.get("href"));
+                if u:return u
+        except: pass
+    return ""
 
-            elements = card.select(
-                selector
-            )
-
-            for element in elements:
-
-                text = clean_text(
-                    element.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-
-                if text:
-                    texts.append(
-                        text
-                    )
-
-        except Exception:
-            pass
-
-    return texts
-
-
-# ============================================================
-# JSON DATA
-# ============================================================
-
-def extract_json_data(card):
-
-    prices = []
-    discounts = []
-
+def parse_card(card,i):
     try:
+        txt=clean(card.get_text(" ",strip=True)); t=title(card); u=link(card)
+        if not txt or not t or not u:return None
+        if TARGET_BRANDS and not any(b.lower() in t.lower() for b in TARGET_BRANDS):return None
+        if any(k in t.lower() for k in EXCLUDE_KEYWORDS):return None
+        ds=[x for x in [discount(txt)] if x]
+        ps=[]
+        for e in card.select(".price,.price-discount,.price-original,.price-old,.original-price,.discount-price,.product-price,[class*='price'],[data-qa*='price'],[data-testid*='price']"):
+            ps+=prices(e.get_text(" ",strip=True))
+        for e in card.find_all():
+            for k,v in e.attrs.items():
+                if isinstance(v,str) and ("price" in k.lower() or "amount" in k.lower()): ps+=prices(v)
+                if isinstance(v,str) and ("discount" in k.lower() or "percent" in k.lower()):
+                    x=discount(v)
+                    if x:ds.append(x)
+        for e in card.find_all("script"):
+            s=e.string or e.get_text()
+            ps+=prices(s)
+            x=discount(s)
+            if x:ds.append(x)
+        if not ps: ps=prices(txt)
+        d=max(ds) if ds else None
+        usd=[x for c,x in ps if c=="USD"]; kzt=[x for c,x in ps if c=="KZT"]
+        if usd:
+            vals=sorted(set(round(x,2) for x in usd)); cur=vals[0]; old=vals[-1] if len(vals)>1 else None
+        elif kzt:
+            vals=sorted(set(round(x/KZT,2) for x in kzt)); cur=vals[0]; old=vals[-1] if len(vals)>1 else None
+        else:return None
+        if cur < MIN_PRICE_USD:return None
+        if not old and d and d<100: old=round(cur/(1-d/100),2)
+        if old and cur and old>cur:
+            calc=round((1-cur/old)*100)
+            if not d or calc>d:d=calc
+        if not d or not cur or not old or d<MIN_DISCOUNT or d>MAX_DISCOUNT or old<=cur:return None
+        cost_kzt=round(cur*KZT)
+        sale_kzt=round(cost_kzt*(1+MARKUP/100))
+        profit_kzt=sale_kzt-cost_kzt
+        if profit_kzt < MIN_PROFIT_KZT:return None
+        return {"id":pid(u),"title":t,"brand":"iHerb","orig_price_usd":old,
+                "discount_price_usd":cur,"discount_percent":int(d),
+                "cost_kzt":cost_kzt,"sale_kzt":sale_kzt,
+                "profit_kzt":profit_kzt,"link":u}
+    except Exception as e:
+        log.debug("card %s: %s",i,e); return None
 
-        for element in card.find_all():
-
-            for key, value in element.attrs.items():
-
-                if not isinstance(
-                    value,
-                    str,
-                ):
-                    continue
-
-                key_lower = key.lower()
-
-                if (
-                    "price"
-                    in key_lower
-                    or "amount"
-                    in key_lower
-                    or "cost"
-                    in key_lower
-                ):
-
-                    prices.extend(
-                        extract_currency_prices(
-                            value
-                        )
-                    )
-
-                if (
-                    "discount"
-                    in key_lower
-                    or "percent"
-                    in key_lower
-                ):
-
-                    discount = (
-                        extract_discount_percent(
-                            value
-                        )
-                    )
-
-                    if discount:
-                        discounts.append(
-                            discount
-                        )
-
-    except Exception:
-        pass
-
-    return (
-        prices,
-        discounts,
-    )
-
-
-# ============================================================
-# SCRIPT DATA
-# ============================================================
-
-def extract_script_price_data(card):
-
-    prices = []
-    discounts = []
-
-    try:
-
-        for script in card.find_all(
-            "script"
-        ):
-
-            text = (
-                script.string
-                or script.get_text()
-            )
-
-            if not text:
-                continue
-
-            prices.extend(
-                extract_currency_prices(
-                    text
-                )
-            )
-
-            discount = (
-                extract_discount_percent(
-                    text
-                )
-            )
-
-            if discount:
-                discounts.append(
-                    discount
-                )
-
-    except Exception:
-        pass
-
-    return (
-        prices,
-        discounts,
-    )
-
-
-# ============================================================
-# IHERB HTML
-# ============================================================
-
-async def get_iherb_html():
-
-    urls = [
-
-        (
-            "https://www.iherb.com/deals"
-            "?lang=en-US&currency=USD"
-        ),
-
-        "https://www.iherb.com/deals",
-
-        "https://kz.iherb.com/deals",
-
-        "https://kz.iherb.com/specials",
-
-        "https://www.iherb.com/specials",
-    ]
-
-    cookies = {
-        "ih-pref":
-            "lan=en-US&currency=USD&country=KZ",
-
-        "iherb-pref":
-            "lan=en-US&currency=USD&country=KZ",
-    }
-
-    # ========================================================
-    # CURL CFFI
-    # ========================================================
-
-    if HAS_CURL_CFFI:
-
-        browsers = [
-            "chrome124",
-            "chrome120",
-            "chrome116",
-            "safari15_5",
-        ]
-
-        for url in urls:
-
-            for browser in browsers:
-
+# ========================= IHERB =========================
+async def get_html():
+    urls=["https://www.iherb.com/deals?lang=en-US&currency=USD","https://www.iherb.com/deals","https://kz.iherb.com/deals","https://kz.iherb.com/specials"]
+    cookies={"ih-pref":"lan=en-US&currency=USD&country=KZ","iherb-pref":"lan=en-US&currency=USD&country=KZ"}
+    if CURL:
+        for u in urls:
+            for b in ["chrome124","chrome120","chrome116"]:
                 try:
-
-                    response = (
-                        await asyncio.to_thread(
-                            curl_requests.get,
-                            url,
-                            headers=HEADERS,
-                            cookies=cookies,
-                            impersonate=browser,
-                            timeout=30,
-                        )
-                    )
-
-                    logger.info(
-                        "iHerb | curl %s | HTTP %s | %s chars",
-                        browser,
-                        response.status_code,
-                        len(response.text),
-                    )
-
-                    if (
-                        response.status_code == 200
-                        and len(response.text) > 10000
-                    ):
-
-                        return response.text
-
-                except Exception as e:
-
-                    logger.debug(
-                        "curl error: %s",
-                        e,
-                    )
-
-    # ========================================================
-    # HTTPX
-    # ========================================================
-
-    for url in urls:
-
+                    r=await asyncio.to_thread(curl_requests.get,u,headers=HEADERS,cookies=cookies,impersonate=b,timeout=30)
+                    log.info("iHerb | curl %s | %s | %s chars",b,r.status_code,len(r.text))
+                    if r.status_code==200 and len(r.text)>10000:return r.text
+                except Exception as e:log.debug("curl: %s",e)
+    for u in urls:
         try:
-
-            async with httpx.AsyncClient(
-                timeout=30,
-                headers=HEADERS,
-                cookies=cookies,
-                follow_redirects=True,
-            ) as client:
-
-                response = await client.get(
-                    url
-                )
-
-                logger.info(
-                    "iHerb | httpx | HTTP %s | %s chars | %s",
-                    response.status_code,
-                    len(response.text),
-                    url,
-                )
-
-                if (
-                    response.status_code == 200
-                    and len(response.text) > 10000
-                ):
-
-                    return response.text
-
-        except Exception as e:
-
-            logger.debug(
-                "httpx error: %s",
-                e,
-            )
-
-    logger.error(
-        "❌ Не удалось получить HTML iHerb."
-    )
-
+            async with httpx.AsyncClient(timeout=30,headers=HEADERS,cookies=cookies,follow_redirects=True) as c:
+                r=await c.get(u); log.info("iHerb | httpx | %s | %s chars",r.status_code,len(r.text))
+                if r.status_code==200 and len(r.text)>10000:return r.text
+        except Exception as e:log.debug("httpx: %s",e)
     return ""
 
-
-# ============================================================
-# PRODUCT CARDS
-# ============================================================
-
-def find_product_cards(soup):
-
-    selectors = [
-
-        ".product-cell-container",
-
-        "[class*='product-cell-container']",
-
-        ".product-inner",
-
-        ".product-card",
-
-        "[data-qa='product-card']",
-
-        ".product-tile",
-
-        "[class*='product-card']",
-
-        "[class*='ProductCard']",
-    ]
-
-    cards = []
-
-    for selector in selectors:
-
+async def fetch_deals():
+    html=await get_html()
+    if not html:return []
+    soup=BeautifulSoup(html,"html.parser")
+    selectors=[".product-cell-container","[class*='product-cell-container']",".product-inner",".product-card","[data-qa='product-card']",".product-tile","[class*='product-card']","[class*='ProductCard']"]
+    cards=[]
+    for s in selectors:
         try:
+            f=soup.select(s)
+            if f: log.info("🔍 %s: %s карточек",s,len(f)); cards+=f
+            if len(f)>=30:break
+        except:pass
+    seen=set(); deals=[]
+    for i,c in enumerate(cards,1):
+        u=link(c); key=u+"|"+clean(c.get_text(" ",strip=True))[:300]
+        if key in seen:continue
+        seen.add(key); d=parse_card(c,i)
+        if d:deals.append(d)
+    unique={d["id"]:d for d in deals}; deals=list(unique.values())
+    deals.sort(key=lambda x:(x.get("profit_kzt",0),x["discount_percent"],-x["discount_price_usd"]),reverse=True)
+    log.info("🔥 Найдено подходящих товаров: %s",len(deals)); return deals
 
-            found = soup.select(
-                selector
-            )
+# ========================= TELEGRAM =========================
+async def validate_chat():
+    global validated_chat
+    if not CHAT_ID:return
+    try:
+        c=await bot.get_chat(CHAT_ID); validated_chat=str(c.id); log.info("✅ CHAT_ID подтверждён: %s",validated_chat)
+    except Exception as e:log.error("❌ CHAT_ID: %s",e)
 
-            if found:
+def targets():
+    x=set(subscribers)
+    if validated_chat:x.add(validated_chat)
+    return x
 
-                logger.info(
-                    "🔍 %s: %s карточек",
-                    selector,
-                    len(found),
-                )
+def message(d):
+    old=d["orig_price_usd"]; cur=d["discount_price_usd"]; disc=d["discount_percent"]
+    cost=d.get("cost_kzt",round(cur*KZT))
+    sale=d.get("sale_kzt",round(cost*(1+MARKUP/100)))
+    profit=d.get("profit_kzt",sale-cost)
+    msg=(f"🔥 <b>НОВАЯ СКИДКА iHERB</b> 🔥\n\n🏷 <b>Бренд:</b> {escape(d['brand'])}\n\n💊 <b>Товар:</b>\n{escape(d['title'])}\n\n📉 <b>СКИДКА: -{disc}%</b>\n\n💰 <b>Цена iHerb:</b>\n<s>${old:.2f}</s> ➡️ <b>${cur:.2f}</b>\n\n🇰🇿 <b>Закуп:</b> ≈ {cost:,} ₸\n\n🏪 <b>Цена продажи:</b> {sale:,} ₸\n\n📈 <b>Прибыль:</b> +{profit:,} ₸\n\n💱 <b>Курс:</b> 1 USD = {KZT:g} ₸\n📈 <b>Наценка:</b> +{MARKUP:g}%\n\n⏰ {datetime.now().strftime('%d.%m.%Y %H:%M')}").replace(",", " ")
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Открыть товар на iHerb",url=d["link"])]])
+    return msg,kb
 
-                cards.extend(
-                    found
-                )
-
-                if len(found) >= 30:
-                    break
-
-        except Exception:
-            pass
-
-    unique = []
-    seen = set()
-
-    for card in cards:
-
-        text = clean_text(
-            card.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-        if not text:
-            continue
-
-        link_element = card.select_one(
-            "a[href]"
-        )
-
-        link = ""
-
-        if link_element:
-
-            link = normalize_url(
-                link_element.get(
-                    "href",
-                    "",
-                )
-            )
-
-        key = (
-            link
-            + "|"
-            + text[:600]
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        unique.append(
-            card
-        )
-
-    logger.info(
-        "📦 Уникальных карточек: %s",
-        len(unique),
-    )
-
-    return unique
-
-
-# ============================================================
-# TITLE
-# ============================================================
-
-def extract_title(card):
-
-    selectors = [
-
-        ".product-title",
-
-        "[class*='product-title']",
-
-        "[class*='ProductTitle']",
-
-        "[class*='title']",
-
-        "[class*='Title']",
-    ]
-
-    for selector in selectors:
-
+async def send(d):
+    msg,kb=message(d); ok=False
+    for chat in list(targets()):
         try:
-
-            element = card.select_one(
-                selector
-            )
-
-            if element:
-
-                title = clean_text(
-                    element.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-
-                if len(title) >= 3:
-                    return title
-
-        except Exception:
-            pass
-
-    try:
-
-        links = card.select(
-            "a[href]"
-        )
-
-        for link in links:
-
-            text = clean_text(
-                link.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            if len(text) >= 10:
-                return text
-
-    except Exception:
-        pass
-
-    return ""
-
-
-# ============================================================
-# LINK
-# ============================================================
-
-def extract_link(card):
-
-    selectors = [
-
-        "a[href*='/pr/']",
-
-        "a[href*='/product/']",
-
-        "a.absolute-link",
-
-        "a[href]",
-    ]
-
-    for selector in selectors:
-
-        try:
-
-            element = card.select_one(
-                selector
-            )
-
-            if not element:
-                continue
-
-            href = normalize_url(
-                element.get(
-                    "href",
-                    "",
-                )
-            )
-
-            if href:
-                return href
-
-        except Exception:
-            pass
-
-    return ""
-
-
-# ============================================================
-# PARSE CARD
-# ============================================================
-
-def parse_product_card(
-    card,
-    index,
-):
-
-    try:
-
-        card_text = clean_text(
-            card.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-        if not card_text:
-            return None
-
-        title = extract_title(
-            card
-        )
-
-        if not title:
-            return None
-
-        link = extract_link(
-            card
-        )
-
-        if not link:
-            return None
-
-        brand = find_brand(
-            title
-        )
-
-        if (
-            TARGET_BRANDS
-            and not brand
-        ):
-            return None
-
-        # ----------------------------------------------------
-        # DISCOUNT
-        # ----------------------------------------------------
-
-        text_discount = (
-            extract_discount_percent(
-                card_text
-            )
-        )
-
-        # ----------------------------------------------------
-        # PRICES
-        # ----------------------------------------------------
-
-        currency_prices = []
-
-        for text in get_card_price_texts(
-            card
-        ):
-
-            currency_prices.extend(
-                extract_currency_prices(
-                    text
-                )
-            )
-
-        json_prices, json_discounts = (
-            extract_json_data(
-                card
-            )
-        )
-
-        currency_prices.extend(
-            json_prices
-        )
-
-        script_prices, script_discounts = (
-            extract_script_price_data(
-                card
-            )
-        )
-
-        currency_prices.extend(
-            script_prices
-        )
-
-        currency_prices.extend(
-            extract_currency_prices(
-                card_text
-            )
-        )
-
-        # ----------------------------------------------------
-        # DISCOUNT CANDIDATES
-        # ----------------------------------------------------
-
-        discount_candidates = []
-
-        if text_discount:
-            discount_candidates.append(
-                text_discount
-            )
-
-        discount_candidates.extend(
-            json_discounts
-        )
-
-        discount_candidates.extend(
-            script_discounts
-        )
-
-        discount_percent = (
-            max(
-                discount_candidates
-            )
-            if discount_candidates
-            else None
-        )
-
-        # ----------------------------------------------------
-        # PRICE
-        # ----------------------------------------------------
-
-        (
-            current_usd,
-            old_usd,
-            currency,
-        ) = choose_prices(
-            currency_prices,
-            discount_percent,
-        )
-
-        # ----------------------------------------------------
-        # CALCULATED DISCOUNT
-        # ----------------------------------------------------
-
-        calculated_discount = (
-            calculate_discount(
-                old_usd,
-                current_usd,
-            )
-        )
-
-        if calculated_discount is not None:
-
-            if (
-                discount_percent is None
-                or calculated_discount > discount_percent
-            ):
-
-                discount_percent = (
-                    calculated_discount
-                )
-
-        # ----------------------------------------------------
-        # OLD PRICE
-        # ----------------------------------------------------
-
-        if (
-            current_usd
-            and discount_percent
-            and not old_usd
-        ):
-
-            old_usd = infer_old_price(
-                current_usd,
-                discount_percent,
-            )
-
-        logger.info(
-            "🔎 CARD #%s | %s | current=%s | old=%s | discount=%s",
-            index,
-            title[:80],
-            current_usd,
-            old_usd,
-            discount_percent,
-        )
-
-        # ----------------------------------------------------
-        # VALIDATION
-        # ----------------------------------------------------
-
-        if not current_usd:
-            return None
-
-        if not discount_percent:
-            return None
-
-        if (
-            discount_percent
-            < MIN_DISCOUNT_PERCENT
-        ):
-            return None
-
-        if (
-            discount_percent
-            > MAX_DISCOUNT_PERCENT
-        ):
-            return None
-
-        if not old_usd:
-            return None
-
-        if old_usd <= current_usd:
-            return None
-
-        product_id = (
-            extract_product_id(
-                link
-            )
-            or link
-        )
-
-        deal = {
-
-            "id": product_id,
-
-            "title": title,
-
-            "brand": (
-                brand
-                or "iHerb"
-            ),
-
-            "orig_price_usd": round(
-                old_usd,
-                2,
-            ),
-
-            "discount_price_usd": round(
-                current_usd,
-                2,
-            ),
-
-            "discount_percent": int(
-                discount_percent
-            ),
-
-            "link": link,
-        }
-
-        logger.info(
-            "🔥 ПРОШЁЛ ФИЛЬТР | -%s%% | $%.2f | %s",
-            deal["discount_percent"],
-            deal["discount_price_usd"],
-            deal["title"][:80],
-        )
-
-        return deal
-
-    except Exception as e:
-
-        logger.exception(
-            "❌ Ошибка карточки #%s: %s",
-            index,
-            e,
-        )
-
-        return None
-
-
-# ============================================================
-# FETCH DEALS
-# ============================================================
-
-async def fetch_iherb_specials():
-
-    logger.info(
-        "🔎 Начинаем проверку iHerb..."
-    )
-
-    html = await get_iherb_html()
-
-    if not html:
-        return []
-
-    try:
-
-        soup = BeautifulSoup(
-            html,
-            "html.parser",
-        )
-
-        cards = find_product_cards(
-            soup
-        )
-
-        deals = []
-
-        for index, card in enumerate(
-            cards,
-            start=1,
-        ):
-
-            deal = parse_product_card(
-                card,
-                index,
-            )
-
-            if deal:
-                deals.append(
-                    deal
-                )
-
-        # ----------------------------------------------------
-        # UNIQUE
-        # ----------------------------------------------------
-
-        unique = {}
-
-        for deal in deals:
-
-            unique[
-                deal["id"]
-            ] = deal
-
-        deals = list(
-            unique.values()
-        )
-
-        # ----------------------------------------------------
-        # SORT
-        # ----------------------------------------------------
-
-        deals.sort(
-            key=lambda x: (
-                x["discount_percent"],
-                -x["discount_price_usd"],
-            ),
-            reverse=True,
-        )
-
-        logger.info(
-            "🔥 Найдено подходящих товаров: %s",
-            len(deals),
-        )
-
-        return deals
-
-    except Exception as e:
-
-        logger.exception(
-            "❌ Ошибка парсинга iHerb: %s",
-            e,
-        )
-
-        return []
-
-
-# ============================================================
-# TELEGRAM CHAT
-# ============================================================
-
-async def validate_configured_chat():
-
-    global validated_chat_id
-
-    if not CHAT_ID:
-
-        logger.warning(
-            "⚠️ CHAT_ID не задан."
-        )
-
-        return
-
-    try:
-
-        chat = await bot.get_chat(
-            CHAT_ID
-        )
-
-        validated_chat_id = str(
-            chat.id
-        )
-
-        chat_name = (
-            getattr(
-                chat,
-                "title",
-                None,
-            )
-            or getattr(
-                chat,
-                "username",
-                None,
-            )
-            or ""
-        )
-
-        logger.info(
-            "✅ CHAT_ID подтверждён: %s | %s",
-            validated_chat_id,
-            chat_name,
-        )
-
-    except Exception as e:
-
-        validated_chat_id = None
-
-        logger.error(
-            "❌ CHAT_ID недоступен: %s",
-            e,
-        )
-
-
-# ============================================================
-# FORMAT MESSAGE
-# ============================================================
-
-def format_deal_message(deal):
-
-    title = escape(
-        deal["title"]
-    )
-
-    brand = escape(
-        deal["brand"]
-    )
-
-    old_usd = deal[
-        "orig_price_usd"
-    ]
-
-    current_usd = deal[
-        "discount_price_usd"
-    ]
-
-    percent = deal[
-        "discount_percent"
-    ]
-
-    link = deal[
-        "link"
-    ]
-
-    # --------------------------------------------------------
-    # KZT COST
-    # --------------------------------------------------------
-
-    cost_kzt = round(
-        current_usd
-        * KZT_EXCHANGE_RATE
-    )
-
-    # --------------------------------------------------------
-    # SALE PRICE
-    # --------------------------------------------------------
-
-    resell_price_kzt = round(
-        cost_kzt
-        * (
-            1
-            + MARGIN_MARKUP_PERCENT
-            / 100
-        )
-    )
-
-    # --------------------------------------------------------
-    # PROFIT
-    # --------------------------------------------------------
-
-    profit_kzt = (
-        resell_price_kzt
-        - cost_kzt
-    )
-
-    cost_str = (
-        f"{cost_kzt:,}"
-        .replace(
-            ",",
-            " ",
-        )
-    )
-
-    resell_str = (
-        f"{resell_price_kzt:,}"
-        .replace(
-            ",",
-            " ",
-        )
-    )
-
-    profit_str = (
-        f"{profit_kzt:,}"
-        .replace(
-            ",",
-            " ",
-        )
-    )
-
-    now = datetime.now(
-        timezone(
-            timedelta(hours=5)
-        )
-    )
-
-    message = (
-
-        "🔥 <b>НОВАЯ СКИДКА iHERB</b> 🔥\n\n"
-
-        f"🏷 <b>Бренд:</b> {brand}\n\n"
-
-        f"💊 <b>Товар:</b>\n"
-        f"{title}\n\n"
-
-        f"📉 <b>СКИДКА: -{percent}%</b>\n\n"
-
-        f"💰 <b>Цена iHerb:</b>\n"
-        f"<s>${old_usd:.2f}</s> "
-        f"➡️ <b>${current_usd:.2f}</b>\n\n"
-
-        f"🇰🇿 <b>Закуп:</b> "
-        f"≈ {cost_str} ₸\n\n"
-
-        f"🏪 <b>Цена продажи:</b> "
-        f"{resell_str} ₸\n\n"
-
-        f"📈 <b>Прибыль:</b> "
-        f"+{profit_str} ₸\n\n"
-
-        f"💱 <b>Курс:</b> "
-        f"1 USD = {KZT_EXCHANGE_RATE:g} ₸\n\n"
-
-        f"📈 <b>Наценка:</b> "
-        f"+{MARGIN_MARKUP_PERCENT:g}%\n\n"
-
-        f"⏰ <b>Обнаружено:</b> "
-        f"{now.strftime('%d.%m.%Y %H:%M')}"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🛒 Открыть товар на iHerb",
-                    url=link,
-                )
-            ]
-        ]
-    )
-
-    return (
-        message,
-        keyboard,
-    )
-
-
-# ============================================================
-# TARGETS
-# ============================================================
-
-def get_targets():
-
-    targets = set()
-
-    if validated_chat_id:
-
-        targets.add(
-            validated_chat_id
-        )
-
-    targets.update(
-        subscribers
-    )
-
-    return targets
-
-
-# ============================================================
-# SEND DEAL
-# ============================================================
-
-async def send_deal(
-    deal,
-    targets,
-):
-
-    message, keyboard = (
-        format_deal_message(
-            deal
-        )
-    )
-
-    success = False
-
-    for target_id in list(
-        targets
-    ):
-
-        try:
-
-            await bot.send_message(
-                chat_id=target_id,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-
-            logger.info(
-                "📤 НОВАЯ СКИДКА ОТПРАВЛЕНА: %s",
-                deal["title"][:100],
-            )
-
-            success = True
-
-            await asyncio.sleep(
-                1.5
-            )
-
+            await bot.send_message(chat,msg,parse_mode=ParseMode.HTML,reply_markup=kb,disable_web_page_preview=True);ok=True;await asyncio.sleep(1.5)
         except TelegramRetryAfter as e:
-
-            retry_after = int(
-                getattr(
-                    e,
-                    "retry_after",
-                    30,
-                )
-            )
-
-            logger.warning(
-                "⏳ Telegram Flood Control. Ждём %s сек.",
-                retry_after + 2,
-            )
-
-            await asyncio.sleep(
-                retry_after + 2
-            )
-
-            try:
-
-                await bot.send_message(
-                    chat_id=target_id,
-                    text=message,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
-                )
-
-                success = True
-
-            except Exception as retry_error:
-
-                logger.error(
-                    "❌ Повторная отправка: %s",
-                    retry_error,
-                )
-
+            await asyncio.sleep(int(getattr(e,"retry_after",30))+2)
+            try:await bot.send_message(chat,msg,parse_mode=ParseMode.HTML,reply_markup=kb,disable_web_page_preview=True);ok=True
+            except Exception as er:log.error("retry: %s",er)
         except Exception as e:
+            s=str(e).lower();log.error("Telegram %s: %s",chat,e)
+            if "chat not found" in s or "bot was kicked" in s or "user is deactivated" in s:subscribers.discard(str(chat))
+    return ok
 
-            error_text = str(e)
-            low = error_text.lower()
-
-            if (
-                "chat not found"
-                in low
-                or "bot was kicked"
-                in low
-                or "user is deactivated"
-                in low
-            ):
-
-                logger.error(
-                    "🚫 Недоступный получатель %s: %s",
-                    target_id,
-                    error_text,
-                )
-
-                subscribers.discard(
-                    str(target_id)
-                )
-
-                continue
-
-            logger.error(
-                "❌ Telegram %s: %s",
-                target_id,
-                error_text,
-            )
-
-    return success
-
-
-# ============================================================
-# CHECK AND NOTIFY
-# ============================================================
-
-async def check_and_notify():
-
-    global last_check_started
-    global last_check_finished
-    global last_check_ok
-    global last_check_found
-    global last_check_sent
-    global check_in_progress
-
-    if check_in_progress:
-
-        logger.warning(
-            "⏭ Проверка уже идёт."
-        )
-
-        return
-
-    check_in_progress = True
-
-    last_check_started = (
-        datetime.now(timezone.utc)
-    )
-
-    last_check_ok = False
-    last_check_sent = 0
-
-    logger.info(
-        "=" * 70
-    )
-
-    logger.info(
-        "🔎 ПРОВЕРКА iHERB"
-    )
-
-    logger.info(
-        "🎯 Скидка: %s%%–%s%%",
-        MIN_DISCOUNT_PERCENT,
-        MAX_DISCOUNT_PERCENT,
-    )
-
-    logger.info(
-        "📦 Лимит: %s",
-        MAX_DEALS_PER_CHECK,
-    )
-
-    logger.info(
-        "=" * 70
-    )
-
+async def check():
+    global checking,last_finished,last_found,last_sent
+    if checking:return
+    checking=True;last_sent=0
     try:
-
-        deals = await fetch_iherb_specials()
-
-        last_check_found = len(
-            deals
-        )
-
-        if not deals:
-
-            last_check_ok = True
-
-            logger.info(
-                "ℹ️ Подходящих скидок не найдено."
-            )
-
-            return
-
-        targets = get_targets()
-
-        if not targets:
-
-            last_check_ok = True
-
-            logger.warning(
-                "⚠️ Нет получателей Telegram."
-            )
-
-            logger.warning(
-                "⚠️ Нажмите /start."
-            )
-
-            return
-
-        sent_count = 0
-        skipped_count = 0
-
-        for deal in deals:
-
-            deal_id = str(
-                deal["id"]
-            )
-
-            # ------------------------------------------------
-            # DUPLICATE PROTECTION
-            # ------------------------------------------------
-
-            if await is_sent(
-                deal_id
-            ):
-
-                skipped_count += 1
-
-                logger.info(
-                    "⏭ Уже отправлялся: %s",
-                    deal["title"][:100],
-                )
-
-                continue
-
-            success = await send_deal(
-                deal,
-                targets,
-            )
-
-            if success:
-
-                await mark_sent(
-                    deal
-                )
-
-                sent_count += 1
-
-            if (
-                sent_count
-                >= MAX_DEALS_PER_CHECK
-            ):
-
-                logger.info(
-                    "🛑 Достигнут лимит %s.",
-                    MAX_DEALS_PER_CHECK,
-                )
-
-                break
-
-        last_check_sent = (
-            sent_count
-        )
-
-        last_check_ok = True
-
-        logger.info(
-            "📊 РЕЗУЛЬТАТ:"
-        )
-
-        logger.info(
-            "🔥 Найдено: %s",
-            len(deals),
-        )
-
-        logger.info(
-            "📤 Отправлено: %s",
-            sent_count,
-        )
-
-        logger.info(
-            "⏭ Уже отправлялось: %s",
-            skipped_count,
-        )
-
-        logger.info(
-            "💾 Сохранено: %s",
-            await cache_count(),
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "❌ Ошибка проверки iHerb: %s",
-            e,
-        )
-
-    finally:
-
-        last_check_finished = (
-            datetime.now(timezone.utc)
-        )
-
-        check_in_progress = False
-
-
-# ============================================================
-# /START
-# ============================================================
-
-@dp.message(
-    Command("start")
-)
-async def start_handler(message):
-
-    chat_id = str(
-        message.chat.id
-    )
-
-    subscribers.add(
-        chat_id
-    )
-
-    await message.answer(
-
-        "👋 <b>iHerb Deal Bot работает!</b>\n\n"
-
-        "🔥 Автоматически ищу "
-        "товары со скидкой.\n\n"
-
-        f"🎯 Минимальная скидка: "
-        f"<b>{MIN_DISCOUNT_PERCENT}%</b>\n"
-
-        f"🎯 Максимальная скидка: "
-        f"<b>{MAX_DISCOUNT_PERCENT}%</b>\n"
-
-        f"⏱ Проверка: "
-        f"<b>каждые {CHECK_INTERVAL_SECONDS // 60} минут</b>\n\n"
-
-        "💰 Поддерживаются "
-        "<b>$</b> и <b>₸</b>.\n\n"
-
-        "📈 Цена продажи и прибыль "
-        "рассчитываются автоматически.",
-
-        reply_markup=main_keyboard,
-
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# /DEALS
-# ============================================================
-
-@dp.message(
-    Command("deals")
-)
-@dp.message(
-    F.text == "🔥 Получить скидки"
-)
-async def deals_handler(message):
-
-    chat_id = str(
-        message.chat.id
-    )
-
-    subscribers.add(
-        chat_id
-    )
-
-    await message.answer(
-        "🔎 Проверяю iHerb прямо сейчас...\n"
-        "⏳ Подождите несколько секунд."
-    )
-
-    await check_and_notify()
-
-
-# ============================================================
-# DATETIME
-# ============================================================
-
-def format_dt(value):
-
-    if not value:
-        return "—"
-
-    try:
-
-        return value.astimezone().strftime(
-            "%d.%m.%Y %H:%M:%S"
-        )
-
-    except Exception:
-
-        return str(value)
-
-
-# ============================================================
-# /STATUS
-# ============================================================
-
-@dp.message(
-    Command("status")
-)
-@dp.message(
-    F.text == "ℹ️ Статус"
-)
-async def status_handler(message):
-
-    chat_id = str(
-        message.chat.id
-    )
-
-    subscribers.add(
-        chat_id
-    )
-
-    brands_text = (
-        "Все бренды"
-        if not TARGET_BRANDS
-        else ", ".join(
-            TARGET_BRANDS
-        )
-    )
-
-    chat_text = (
-        f"🟢 {validated_chat_id}"
-        if validated_chat_id
-        else "🔴 CHAT_ID не подключён"
-    )
-
-    storage_text = (
-        "PostgreSQL"
-        if (
-            DATABASE_URL
-            and HAS_POSTGRES
-        )
-        else "Временный cache /tmp"
-    )
-
-    await message.answer(
-
-        "📊 <b>СТАТУС БОТА</b>\n\n"
-
-        "🟢 Telegram: ONLINE\n"
-
-        "🟢 Автомониторинг: ВКЛЮЧЁН\n"
-
-        f"🔄 Проверка: каждые "
-        f"{CHECK_INTERVAL_SECONDS // 60} минут\n\n"
-
-        f"🎯 Минимальная скидка: "
-        f"<b>{MIN_DISCOUNT_PERCENT}%</b>\n"
-
-        f"🎯 Максимальная скидка: "
-        f"<b>{MAX_DISCOUNT_PERCENT}%</b>\n"
-
-        f"📦 Лимит за проверку: "
-        f"<b>{MAX_DEALS_PER_CHECK}</b>\n\n"
-
-        f"🏷 Бренды: {brands_text}\n\n"
-
-        f"💱 Курс: "
-        f"1 USD = {KZT_EXCHANGE_RATE:g} ₸\n"
-
-        f"📈 Наценка: "
-        f"+{MARGIN_MARKUP_PERCENT:g}%\n\n"
-
-        f"📨 Основной чат: "
-        f"{chat_text}\n"
-
-        f"👥 Получателей: "
-        f"{len(get_targets())}\n"
-
-        f"💾 Хранилище: "
-        f"{storage_text}\n"
-
-        f"💾 Отправлено ранее: "
-        f"{await cache_count()} товаров\n\n"
-
-        f"🕒 Последняя проверка: "
-        f"{format_dt(last_check_finished)}\n"
-
-        f"📦 Найдено: "
-        f"{last_check_found}\n"
-
-        f"📤 Отправлено: "
-        f"{last_check_sent}\n"
-
-        f"➡️ Следующая: "
-        f"{format_dt(next_check_at)}",
-
-        reply_markup=main_keyboard,
-
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# OTHER MESSAGE
-# ============================================================
+        deals=await fetch_deals();last_found=len(deals)
+        if not deals:return
+        if not targets():log.warning("⚠️ Нет получателей. Нажмите /start");return
+        for d in deals:
+            if await is_sent(d["id"]):continue
+            if await send(d):
+                await mark_sent(d);last_sent+=1
+            if last_sent>=MAX_SEND:break
+        log.info("📊 Найдено=%s | Отправлено=%s | Уже сохранено=%s",last_found,last_sent,await stored_count())
+    except Exception as e:log.exception("❌ Проверка: %s",e)
+    finally:checking=False;last_finished=datetime.now(timezone.utc)
+
+# ========================= HANDLERS =========================
+@dp.message(Command("start"))
+async def start(m):
+    subscribers.add(str(m.chat.id));await m.answer(f"👋 <b>iHerb Deal Bot работает!</b>\n\n🔥 Скидки: <b>{MIN_DISCOUNT}%–{MAX_DISCOUNT}%</b>\n⏱ Проверка каждые <b>{INTERVAL//60} минут</b>.",reply_markup=keyboard,parse_mode=ParseMode.HTML)
+
+@dp.message(Command("deals"))
+@dp.message(F.text=="🔥 Получить скидки")
+async def deals(m):
+    subscribers.add(str(m.chat.id));await m.answer("🔎 Проверяю iHerb прямо сейчас...");await check()
+
+def fmt(t):
+    if not t:return "—"
+    try:return t.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+    except:return str(t)
+
+@dp.message(Command("status"))
+@dp.message(F.text=="ℹ️ Статус")
+async def status(m):
+    subscribers.add(str(m.chat.id));storage="PostgreSQL" if DATABASE_URL and asyncpg else "временный /tmp cache"
+    await m.answer(f"📊 <b>СТАТУС БОТА</b>\n\n🟢 Telegram: ONLINE\n🟢 Мониторинг: ВКЛЮЧЁН\n🔄 Интервал: {INTERVAL} сек.\n🎯 Скидка: {MIN_DISCOUNT}%–{MAX_DISCOUNT}%\n📦 Лимит: {MAX_SEND}\n💱 Курс: {KZT:g} ₸\n📈 Наценка: {MARKUP:g}%\n👥 Получателей: {len(targets())}\n💾 Хранилище: {storage}\n💾 Сохранено: {await stored_count()}\n🕒 Последняя проверка: {fmt(last_finished)}\n📦 Найдено: {last_found}\n📤 Отправлено: {last_sent}\n➡️ Следующая: {fmt(next_check)}",reply_markup=keyboard,parse_mode=ParseMode.HTML)
 
 @dp.message()
-async def any_message_handler(message):
+async def other(m):
+    subscribers.add(str(m.chat.id));await m.answer("👋 Используйте кнопки ниже.",reply_markup=keyboard)
 
-    subscribers.add(
-        str(message.chat.id)
-    )
-
-    await message.answer(
-
-        "👋 <b>iHerb Deal Bot</b>\n\n"
-
-        f"🔥 Минимальная скидка: "
-        f"<b>{MIN_DISCOUNT_PERCENT}%</b>\n\n"
-
-        "Используйте:\n\n"
-
-        "🔥 <b>Получить скидки</b> — "
-        "проверить iHerb сейчас.\n\n"
-
-        "ℹ️ <b>Статус</b> — "
-        "посмотреть настройки.",
-
-        reply_markup=main_keyboard,
-
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# SCHEDULER
-# ============================================================
-
+# ========================= BACKGROUND =========================
 async def scheduler():
-
-    global next_check_at
-
-    logger.info(
-        "🚀 АВТОМАТИЧЕСКИЙ МОНИТОРИНГ ЗАПУЩЕН"
-    )
-
-    logger.info(
-        "⚡ Первая проверка выполняется СРАЗУ"
-    )
-
+    global next_check
+    log.info("🚀 АВТОМАТИЧЕСКИЙ МОНИТОРИНГ ЗАПУЩЕН")
     while True:
-
-        try:
-
-            await check_and_notify()
-
-            next_check_at = (
-                datetime.now(timezone.utc)
-                + timedelta(
-                    seconds=CHECK_INTERVAL_SECONDS
-                )
-            )
-
-            logger.info(
-                "💤 Следующая проверка: %s",
-                format_dt(
-                    next_check_at
-                ),
-            )
-
-            remaining = (
-                CHECK_INTERVAL_SECONDS
-            )
-
-            while remaining > 0:
-
-                sleep_time = min(
-                    30,
-                    remaining,
-                )
-
-                await asyncio.sleep(
-                    sleep_time
-                )
-
-                remaining -= (
-                    sleep_time
-                )
-
-        except asyncio.CancelledError:
-
-            logger.info(
-                "🛑 Мониторинг остановлен."
-            )
-
-            raise
-
-        except Exception as e:
-
-            logger.exception(
-                "❌ Scheduler: %s",
-                e,
-            )
-
-            next_check_at = (
-                datetime.now(timezone.utc)
-                + timedelta(
-                    seconds=30
-                )
-            )
-
-            await asyncio.sleep(
-                30
-            )
-
-
-# ============================================================
-# HEARTBEAT
-# ============================================================
+        await check();next_check=datetime.now(timezone.utc)+timedelta(seconds=INTERVAL);await asyncio.sleep(INTERVAL)
 
 async def heartbeat():
-
     while True:
+        try:log.info("❤️ HEARTBEAT | alive | last_check=%s | next=%s | in_progress=%s",fmt(last_finished),fmt(next_check),checking);await asyncio.sleep(HEARTBEAT)
+        except asyncio.CancelledError:return
 
-        try:
-
-            logger.info(
-                "❤️ HEARTBEAT | alive | "
-                "last=%s | "
-                "next=%s | "
-                "checking=%s",
-                format_dt(
-                    last_check_finished
-                ),
-                format_dt(
-                    next_check_at
-                ),
-                check_in_progress,
-            )
-
-            await asyncio.sleep(
-                HEARTBEAT_SECONDS
-            )
-
-        except asyncio.CancelledError:
-
-            return
-
-
-# ============================================================
-# RENDER HEALTH SERVER
-# ============================================================
-
-async def start_health_server():
-
+async def health_server():
     try:
-
         from aiohttp import web
-
-        port = int(
-            os.environ.get(
-                "PORT",
-                "10000",
-            )
-        )
-
-        app = web.Application()
-
-        async def home(request):
-
-            return web.Response(
-                text=(
-                    "iHerb Telegram Bot "
-                    "is running!"
-                )
-            )
-
-        async def health(request):
-
-            return web.Response(
-                text="OK"
-            )
-
-        app.router.add_get(
-            "/",
-            home,
-        )
-
-        app.router.add_get(
-            "/health",
-            health,
-        )
-
-        runner = web.AppRunner(
-            app
-        )
-
-        await runner.setup()
-
-        site = web.TCPSite(
-            runner,
-            "0.0.0.0",
-            port,
-        )
-
-        await site.start()
-
-        logger.info(
-            "🌐 Health Server запущен: %s",
-            port,
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "❌ Health Server: %s",
-            e,
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
+        app=web.Application()
+        async def home(r):return web.Response(text="iHerb Telegram Bot is running!")
+        async def health(r):return web.Response(text="OK")
+        app.router.add_get("/",home);app.router.add_get("/health",health)
+        runner=web.AppRunner(app);await runner.setup();await web.TCPSite(runner,"0.0.0.0",int(os.getenv("PORT","10000"))).start();log.info("🌐 Health server запущен")
+    except Exception as e:log.exception("Health server: %s",e)
 
 async def main():
-
-    logger.info(
-        "=" * 70
-    )
-
-    logger.info(
-        "🚀 ЗАПУСК iHERB TELEGRAM BOT"
-    )
-
-    logger.info(
-        "=" * 70
-    )
-
-    logger.info(
-        "🎯 Скидка: %s%%–%s%%",
-        MIN_DISCOUNT_PERCENT,
-        MAX_DISCOUNT_PERCENT,
-    )
-
-    logger.info(
-        "💱 USD/KZT: %s",
-        KZT_EXCHANGE_RATE,
-    )
-
-    logger.info(
-        "📈 Наценка: %s%%",
-        MARGIN_MARKUP_PERCENT,
-    )
-
-    logger.info(
-        "📦 Лимит: %s",
-        MAX_DEALS_PER_CHECK,
-    )
-
-    logger.info(
-        "⏱ Интервал: %s секунд",
-        CHECK_INTERVAL_SECONDS,
-    )
-
-    logger.info(
-        "💾 Cache path: %s",
-        CACHE_FILE,
-    )
-
-    # --------------------------------------------------------
-    # STORAGE
-    # --------------------------------------------------------
-
-    await init_storage()
-
-    # --------------------------------------------------------
-    # HEALTH
-    # --------------------------------------------------------
-
-    await start_health_server()
-
-    # --------------------------------------------------------
-    # TELEGRAM CHAT
-    # --------------------------------------------------------
-
-    await validate_configured_chat()
-
-    # --------------------------------------------------------
-    # TASKS
-    # --------------------------------------------------------
-
-    scheduler_task = asyncio.create_task(
-        scheduler()
-    )
-
-    heartbeat_task = asyncio.create_task(
-        heartbeat()
-    )
-
-    # --------------------------------------------------------
-    # TELEGRAM POLLING
-    # --------------------------------------------------------
-
-    while True:
-
-        try:
-
-            try:
-
-                await bot.delete_webhook(
-                    drop_pending_updates=True
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "Webhook cleanup: %s",
-                    e,
-                )
-
-            logger.info(
-                "📡 Запускаю Telegram polling..."
-            )
-
-            await dp.start_polling(
-                bot
-            )
-
-            break
-
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception as e:
-
-            error_text = str(
-                e
-            )
-
-            logger.error(
-                "❌ Telegram polling: %s",
-                error_text,
-            )
-
-            if (
-                "Conflict"
-                in error_text
-                or "409"
-                in error_text
-                or "terminated by other"
-                in error_text
-            ):
-
-                logger.warning(
-                    "⚠️ Telegram Conflict."
-                )
-
-                logger.warning(
-                    "⚠️ Возможно запущен второй экземпляр."
-                )
-
-                await asyncio.sleep(
-                    15
-                )
-
-            elif (
-                "Unauthorized"
-                in error_text
-                or "401"
-                in error_text
-            ):
-
-                logger.error(
-                    "❌ TELEGRAM UNAUTHORIZED!"
-                )
-
-                logger.error(
-                    "❌ Проверьте BOT_TOKEN."
-                )
-
-                await asyncio.sleep(
-                    30
-                )
-
-            else:
-
-                logger.warning(
-                    "🔄 Повторный запуск Telegram через 10 секунд."
-                )
-
-                await asyncio.sleep(
-                    10
-                )
-
-    # --------------------------------------------------------
-    # STOP
-    # --------------------------------------------------------
-
-    scheduler_task.cancel()
-    heartbeat_task.cancel()
-
-    for task in (
-        scheduler_task,
-        heartbeat_task,
-    ):
-
-        try:
-
-            await task
-
-        except asyncio.CancelledError:
-
-            pass
-
-    await bot.session.close()
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
+    await storage_init();await health_server();await validate_chat()
+    st=asyncio.create_task(scheduler());hb=asyncio.create_task(heartbeat())
     try:
+        while True:
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                log.info("📡 Telegram polling запускается")
+                await dp.start_polling(bot);break
+            except asyncio.CancelledError:raise
+            except Exception as e:
+                s=str(e);log.error("❌ Telegram polling: %s",e);await asyncio.sleep(15 if ("409" in s or "Conflict" in s) else 10)
+    finally:
+        st.cancel();hb.cancel()
+        for t in (st,hb):
+            try:await t
+            except asyncio.CancelledError:pass
+        if db_pool:
+            try:
+                await db_pool.close()
+            except Exception:
+                pass
+        await bot.session.close()
 
-        asyncio.run(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        logger.info(
-            "🛑 Бот остановлен."
-        )
+if __name__=="__main__":
+    asyncio.run(main())
