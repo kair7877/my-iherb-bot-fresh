@@ -10,6 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramRetryAfter
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("iherb")
@@ -40,6 +41,9 @@ HEARTBEAT = max(30, intval("HEARTBEAT_SECONDS", 60))
 MIN_PROFIT_KZT = max(0, intval("MIN_PROFIT_KZT", 1000))
 MIN_PRICE_USD = max(0, numval("MIN_PRICE_USD", 3))
 DATABASE_URL = env("DATABASE_URL")
+WEBHOOK_URL = env("WEBHOOK_URL") or env("RENDER_EXTERNAL_URL")
+WEBHOOK_PATH = env("WEBHOOK_PATH", "/telegram/webhook")
+WEBHOOK_SECRET = env("WEBHOOK_SECRET", "")
 TARGET_BRANDS = []
 EXCLUDE_KEYWORDS = [x.strip().lower() for x in env(
     "EXCLUDE_KEYWORDS", "ebook,book,audiobook,gift card,giftcard,free sample,sample only"
@@ -337,11 +341,18 @@ async def send(d):
     msg,kb=message(d); ok=False
     for chat in list(targets()):
         try:
-            await bot.send_message(chat,msg,parse_mode=ParseMode.HTML,reply_markup=kb,disable_web_page_preview=True);ok=True;await asyncio.sleep(1.5)
+            sent_msg = await bot.send_message(chat,msg,parse_mode=ParseMode.HTML,reply_markup=kb,disable_web_page_preview=True)
+            ok=True
+            log.info("📨 TELEGRAM OK | chat_id=%s | message_id=%s | product=%s", chat, sent_msg.message_id, d["id"])
+            await asyncio.sleep(1.5)
         except TelegramRetryAfter as e:
             await asyncio.sleep(int(getattr(e,"retry_after",30))+2)
-            try:await bot.send_message(chat,msg,parse_mode=ParseMode.HTML,reply_markup=kb,disable_web_page_preview=True);ok=True
-            except Exception as er:log.error("retry: %s",er)
+            try:
+                sent_msg = await bot.send_message(chat,msg,parse_mode=ParseMode.HTML,reply_markup=kb,disable_web_page_preview=True)
+                ok=True
+                log.info("📨 TELEGRAM RETRY OK | chat_id=%s | message_id=%s | product=%s", chat, sent_msg.message_id, d["id"])
+            except Exception as er:
+                log.error("retry: %s",er)
         except Exception as e:
             s=str(e).lower();log.error("Telegram %s: %s",chat,e)
             if "chat not found" in s or "bot was kicked" in s or "user is deactivated" in s:subscribers.discard(str(chat))
@@ -379,11 +390,34 @@ def fmt(t):
     try:return t.astimezone().strftime("%d.%m.%Y %H:%M:%S")
     except:return str(t)
 
+@dp.message(Command("test"))
+async def test_message(m):
+    subscribers.add(str(m.chat.id))
+    try:
+        me = await bot.get_me()
+        await m.answer(
+            "✅ <b>ТЕСТ УСПЕШЕН</b>\n\n"
+            f"🤖 Бот: @{escape(me.username or 'unknown')}\n"
+            f"🆔 Chat ID: <code>{m.chat.id}</code>\n"
+            "📡 Режим Telegram: WEBHOOK\n"
+            "🟢 Связь с Telegram работает.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        log.info("🧪 TEST OK | chat_id=%s", m.chat.id)
+    except Exception as e:
+        log.exception("❌ TEST ERROR: %s", e)
+        try:
+            await m.answer(f"❌ Тест Telegram не прошёл: {escape(str(e))}")
+        except Exception:
+            pass
+
+
 @dp.message(Command("status"))
 @dp.message(F.text=="ℹ️ Статус")
 async def status(m):
-    subscribers.add(str(m.chat.id));storage="PostgreSQL" if DATABASE_URL and asyncpg else "временный /tmp cache"
-    await m.answer(f"📊 <b>СТАТУС БОТА</b>\n\n🟢 Telegram: ONLINE\n🟢 Мониторинг: ВКЛЮЧЁН\n🔄 Интервал: {INTERVAL} сек.\n🎯 Скидка: {MIN_DISCOUNT}%–{MAX_DISCOUNT}%\n📦 Лимит: {MAX_SEND}\n💱 Курс: {KZT:g} ₸\n📈 Наценка: {MARKUP:g}%\n👥 Получателей: {len(targets())}\n💾 Хранилище: {storage}\n💾 Сохранено: {await stored_count()}\n🕒 Последняя проверка: {fmt(last_finished)}\n📦 Найдено: {last_found}\n📤 Отправлено: {last_sent}\n➡️ Следующая: {fmt(next_check)}",reply_markup=keyboard,parse_mode=ParseMode.HTML)
+    subscribers.add(str(m.chat.id));storage=storage_mode
+    await m.answer(f"📊 <b>СТАТУС БОТА</b>\n\n🟢 Telegram: WEBHOOK ONLINE\n🟢 Мониторинг: ВКЛЮЧЁН\n🔄 Интервал: {INTERVAL} сек.\n🎯 Скидка: {MIN_DISCOUNT}%–{MAX_DISCOUNT}%\n📦 Лимит: {MAX_SEND}\n💱 Курс: {KZT:g} ₸\n📈 Наценка: {MARKUP:g}%\n👥 Получателей: {len(targets())}\n💾 Хранилище: {storage}\n💾 Сохранено: {await stored_count()}\n🕒 Последняя проверка: {fmt(last_finished)}\n📦 Найдено: {last_found}\n📤 Отправлено: {last_sent}\n➡️ Следующая: {fmt(next_check)}",reply_markup=keyboard,parse_mode=ParseMode.HTML)
 
 @dp.message()
 async def other(m):
@@ -412,28 +446,113 @@ async def health_server():
     except Exception as e:log.exception("Health server: %s",e)
 
 async def main():
-    await storage_init();await health_server();await validate_chat()
-    st=asyncio.create_task(scheduler());hb=asyncio.create_task(heartbeat())
+    # ============================================================
+    # Telegram работает ТОЛЬКО через WEBHOOK.
+    # getUpdates / polling полностью отключён.
+    # Это устраняет TelegramConflictError от второго экземпляра.
+    # ============================================================
+    await storage_init()
+    await validate_chat()
+
+    if not WEBHOOK_URL:
+        raise RuntimeError(
+            "WEBHOOK_URL не задан. Добавьте в Render Environment Variables "
+            "WEBHOOK_URL=https://my-iherb-bot-fresh.onrender.com"
+        )
+
+    webhook_full_url = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
+    log.info("🌐 Webhook URL: %s", webhook_full_url)
+
     try:
-        while True:
-            try:
-                await bot.delete_webhook(drop_pending_updates=True)
-                log.info("📡 Telegram polling запускается")
-                await dp.start_polling(bot);break
-            except asyncio.CancelledError:raise
-            except Exception as e:
-                s=str(e);log.error("❌ Telegram polling: %s",e);await asyncio.sleep(15 if ("409" in s or "Conflict" in s) else 10)
+        await bot.set_webhook(
+            url=webhook_full_url,
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=True,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+        info = await bot.get_webhook_info()
+        log.info(
+            "✅ Telegram WEBHOOK установлен | url=%s | pending=%s | last_error=%s",
+            info.url,
+            info.pending_update_count,
+            info.last_error_message or "нет",
+        )
+    except Exception as e:
+        log.exception("❌ Не удалось установить Telegram webhook: %s", e)
+        raise
+
+    from aiohttp import web
+
+    app = web.Application()
+
+    async def home(request):
+        return web.json_response({
+            "status": "ok",
+            "service": "iHerb Telegram Bot",
+            "telegram": "webhook",
+            "monitor": "running",
+            "storage": storage_mode,
+            "last_check": fmt(last_finished),
+            "last_found": last_found,
+            "last_sent": last_sent,
+        })
+
+    async def health(request):
+        return web.Response(text="OK")
+
+    app.router.add_get("/", home)
+    app.router.add_get("/health", health)
+
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET or None,
+    )
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    scheduler_task = asyncio.create_task(scheduler(), name="iherb-scheduler")
+    heartbeat_task = asyncio.create_task(heartbeat(), name="heartbeat")
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+
+    try:
+        await site.start()
+        log.info("🌐 HTTP/WEBHOOK сервер запущен на порту %s", port)
+        log.info("🚀 АВТОМАТИЧЕСКИЙ МОНИТОРИНГ ЗАПУЩЕН")
+        log.info("📡 Telegram работает ТОЛЬКО через WEBHOOK")
+        log.info("🛑 getUpdates/polling полностью отключён")
+        await asyncio.Event().wait()
+
+    except asyncio.CancelledError:
+        raise
     finally:
-        st.cancel();hb.cancel()
-        for t in (st,hb):
-            try:await t
-            except asyncio.CancelledError:pass
+        scheduler_task.cancel()
+        heartbeat_task.cancel()
+
+        for task in (scheduler_task, heartbeat_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+
         if db_pool:
             try:
                 await db_pool.close()
             except Exception:
                 pass
+
+        await runner.cleanup()
         await bot.session.close()
+
 
 if __name__=="__main__":
     asyncio.run(main())
